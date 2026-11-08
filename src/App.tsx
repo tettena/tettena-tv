@@ -15,7 +15,7 @@ import {
   Maximize2,
   Minimize2,
 } from 'lucide-react';
-import { ChatMessage, EmotionType, GameContext, ObsSettings, ToneStyle } from './types';
+import { ChatMessage, EmotionType, GameContext, ObsSettings, ToneStyle, MemoryItem, ApiStatusInfo } from './types';
 import { TetenaAvatar } from './components/TetenaAvatar';
 import { SubtitleBar } from './components/SubtitleBar';
 import { ControlPanel } from './components/ControlPanel';
@@ -26,8 +26,8 @@ import { AivisSpeechChecker } from './components/AivisSpeechChecker';
 import { synthesizeAivisAudio } from './utils/aivisSpeech';
 
 const DEFAULT_GAME_CONTEXT: GameContext = {
-  gameTitle: 'モンスターハンター',
-  currentSituation: '通常クエスト中',
+  gameTitle: 'おまかせ・自動認識',
+  currentSituation: '何でも気軽に雑談＆プレイ中',
   toneStyle: 'tsukkomi',
 };
 
@@ -58,14 +58,115 @@ export default function App() {
   const [isLoading, setIsLoading] = useState(false);
 
   const [currentSubtitle, setCurrentSubtitle] = useState<string>(
-    '実況準備完了だよ！一緒に配信盛り上げていこうね！'
+    'クマ様、実況準備完了だよ！一緒に配信盛り上げていこうね！'
   );
   const [streamerSubtitle, setStreamerSubtitle] = useState<string>('');
   const [currentEmotion, setCurrentEmotion] = useState<EmotionType>('happy');
   const [tsukkomiScore, setTsukkomiScore] = useState<number>(1);
 
-  const [chatHistory, setChatHistory] = useState<ChatMessage[]>([]);
-  const [gameContext, setGameContext] = useState<GameContext>(DEFAULT_GAME_CONTEXT);
+  // Persistent Chat History
+  const [chatHistory, setChatHistory] = useState<ChatMessage[]>(() => {
+    try {
+      const saved = localStorage.getItem('tetena_chat_history_v2');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed)) return parsed.slice(-30);
+      }
+    } catch (e) {
+      console.warn('Failed to load chat history:', e);
+    }
+    return [];
+  });
+
+  useEffect(() => {
+    try {
+      const toSave = chatHistory.slice(-30).map((msg) => ({
+        ...msg,
+        audioBase64: null, // do not store heavy audio payloads in localStorage
+      }));
+      localStorage.setItem('tetena_chat_history_v2', JSON.stringify(toSave));
+    } catch (e) {
+      console.warn('Failed to save chat history:', e);
+    }
+  }, [chatHistory]);
+
+  // Persistent Game Context
+  const [gameContext, setGameContext] = useState<GameContext>(() => {
+    try {
+      const saved = localStorage.getItem('tetena_game_context_v2');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (parsed.gameTitle === 'モンスターハンター' && parsed.currentSituation === '通常クエスト中') {
+          return DEFAULT_GAME_CONTEXT;
+        }
+        return { ...DEFAULT_GAME_CONTEXT, ...parsed };
+      }
+    } catch (e) {
+      console.warn('Failed to load gameContext:', e);
+    }
+    return DEFAULT_GAME_CONTEXT;
+  });
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('tetena_game_context_v2', JSON.stringify(gameContext));
+    } catch (e) {
+      console.warn('Failed to save gameContext:', e);
+    }
+  }, [gameContext]);
+
+  // Lightweight Long-term Memory
+  const [memories, setMemories] = useState<MemoryItem[]>(() => {
+    try {
+      const saved = localStorage.getItem('tetena_long_term_memories_v1');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+      }
+    } catch (e) {
+      console.warn('Failed to load memories:', e);
+    }
+    return [
+      { id: 'mem-1', content: '相棒（配信者）の呼び名は「クマ様」', createdAt: Date.now() },
+      { id: 'mem-2', content: 'ゲーム・犬・猫・バイク・日常の話題が大好き', createdAt: Date.now() },
+    ];
+  });
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('tetena_long_term_memories_v1', JSON.stringify(memories));
+    } catch (e) {
+      console.warn('Failed to save memories:', e);
+    }
+  }, [memories]);
+
+  const handleAddMemory = (content: string) => {
+    if (!content.trim()) return;
+    const newItem: MemoryItem = {
+      id: 'mem-' + Date.now(),
+      content: content.trim(),
+      createdAt: Date.now(),
+    };
+    setMemories((prev) => [...prev, newItem]);
+  };
+
+  const handleEditMemory = (id: string, newContent: string) => {
+    setMemories((prev) =>
+      prev.map((m) => (m.id === id ? { ...m, content: newContent.trim() } : m))
+    );
+  };
+
+  const handleDeleteMemory = (id: string) => {
+    setMemories((prev) => prev.filter((m) => m.id !== id));
+  };
+
+  // Detailed API status tracking (modelUsed, error differentiation)
+  const [apiStatus, setApiStatus] = useState<ApiStatusInfo>({
+    activeEngine: 'Gemini',
+    modelUsed: 'gemini-3.1-flash-lite',
+    errorType: 'NONE',
+  });
+
   const [obsSettings, setObsSettings] = useState<ObsSettings>(DEFAULT_OBS_SETTINGS);
   const [volume, setVolume] = useState(1.0);
   const [voiceName, setVoiceName] = useState('Kore');
@@ -254,13 +355,22 @@ export default function App() {
       };
       setChatHistory((prev) => [...prev, streamerMsg]);
 
+      // 環境判定: Windows PC等のローカル実行環境 (localhost / 127.0.0.1) かどうかを安全に判定
+      const isLocalEnvironment =
+        typeof window !== 'undefined' &&
+        Boolean(
+          window.location.hostname === 'localhost' ||
+          window.location.hostname === '127.0.0.1' ||
+          window.location.hostname === '0.0.0.0'
+        );
+
       try {
         const response = await fetch('/api/talk', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             message: messageText,
-            history: chatHistory.slice(-6).map((m) => ({
+            history: chatHistory.slice(-8).map((m) => ({
               role: m.sender === 'streamer' ? 'user' : 'model',
               text: m.text,
             })),
@@ -268,24 +378,20 @@ export default function App() {
             currentSituation: gameContext.currentSituation,
             toneStyle: gameContext.toneStyle,
             voiceName,
+            skipServerTTS: isLocalEnvironment,
+            memories: memories.map((m) => m.content),
           }),
         });
 
-        let data: any = null;
-        if (response.ok) {
-          data = await response.json();
-        } else {
-          // If server returns error, create local conversational response
-          data = {
-            replyText: 'うんうん、しっかり見てるよ！相棒、次の作戦いこう！',
-            displaySubtitle: 'うんうん、しっかり見てるよ！相棒、次の作戦いこう！🎮',
-            emotion: 'happy',
-            tsukkomiScore: 1,
-            audioBase64: null,
-            fallbackToBrowserTTS: true,
-            isOfflineFallback: true,
-            quotaExceeded: true,
-          };
+        if (!response.ok) {
+          const errData = await response.json().catch(() => ({}));
+          throw new Error(errData.error || `HTTP ${response.status} エラー`);
+        }
+
+        const data = await response.json();
+
+        if (data.apiStatus) {
+          setApiStatus(data.apiStatus);
         }
 
         const {
@@ -318,15 +424,6 @@ export default function App() {
         let isUsingFallbackSpeech = fallbackToBrowserTTS;
         let activeEngine: 'Gemini' | 'Aivis' | 'Browser' = 'Gemini';
 
-        // 環境判定: Windows PC等のローカル実行環境 (localhost / 127.0.0.1) かどうかを安全に判定
-        const isLocalEnvironment =
-          typeof window !== 'undefined' &&
-          Boolean(
-            window.location.hostname === 'localhost' ||
-            window.location.hostname === '127.0.0.1' ||
-            window.location.hostname === '0.0.0.0'
-          );
-
         if (isLocalEnvironment) {
           // 【ローカル実行環境】: AivisSpeech (さつき: 1935723904) を最優先で試行
           console.log(
@@ -344,21 +441,20 @@ export default function App() {
                 '✅ [音声エンジン: AivisSpeech] AivisSpeech 合成に成功しました！「さつき」モデルの音声で再生します。'
               );
             } else {
-              // AivisSpeech失敗時はブラウザ音声へフォールバック
+              // AivisSpeech失敗時：勝手にロボット声へ切り替えず、原因を明示
               finalAudioBase64 = null;
-              isUsingFallbackSpeech = true;
-              activeEngine = 'Browser';
-              console.warn(
-                `🔄 [ローカル環境フォールバック] AivisSpeech 合成失敗 (${aivisRes.error || '未生成'})。ブラウザ音声 (Web Speech API) へフォールバックします。`
-              );
+              isUsingFallbackSpeech = false;
+              activeEngine = 'Aivis';
+              const errorReason = aivisRes.error || 'AivisSpeech Engine (127.0.0.1:10101) が停止しているか接続できません。';
+              console.warn(`⚠️ [AivisSpeech 停止/未接続] ${errorReason}`);
+              setCurrentSubtitle(`${displaySubtitle || replyText}（⚠️ AivisSpeech未接続: Engineを起動してください）`);
             }
           } catch (aivisErr: any) {
             finalAudioBase64 = null;
-            isUsingFallbackSpeech = true;
-            activeEngine = 'Browser';
-            console.warn(
-              `🔄 [ローカル環境フォールバック] AivisSpeech 例外発生 (${aivisErr?.message || aivisErr})。ブラウザ音声 (Web Speech API) へフォールバックします。`
-            );
+            isUsingFallbackSpeech = false;
+            activeEngine = 'Aivis';
+            console.warn(`⚠️ [AivisSpeech 例外] ${aivisErr?.message || aivisErr}`);
+            setCurrentSubtitle(`${displaySubtitle || replyText}（⚠️ AivisSpeech未接続: Engineを起動してください）`);
           }
         } else {
           // 【クラウドプレビュー環境 (または判定不能時)】: 従来のGemini TTS優先ロジックを厳密に維持
@@ -443,19 +539,23 @@ export default function App() {
           );
           if (finalAudioBase64) {
             await audioPlayer.playWavBase64(finalAudioBase64);
-          } else if (isUsingFallbackSpeech || !finalAudioBase64) {
+          } else if (isUsingFallbackSpeech) {
             await audioPlayer.speakBrowserFallback(replyText);
           }
         }
       } catch (err: any) {
-        console.warn('Network issue, using client fail-safe response:', err);
-        const fallbackText = 'ばっちり見てるよー！相棒、その調子で楽しんでいこーっ！';
-        setCurrentSubtitle(fallbackText);
-        setCurrentEmotion('happy');
-        setIsUsingBrowserAudio(true);
-        if (!isObsUrlMode) {
-          audioPlayer.speakBrowserFallback(fallbackText).catch(() => {});
-        }
+        console.error('Talk API error:', err);
+        const errorMsg = '⚠️ [AI通信エラー] 回答の取得に失敗しました: ' + (err?.message || 'ネットワークエラー');
+        setCurrentSubtitle(errorMsg);
+        setCurrentEmotion('worry');
+        setIsUsingBrowserAudio(false);
+        setApiStatus({
+          activeEngine: 'LocalFallback',
+          modelUsed: 'local-companion',
+          errorType: 'API_ERROR',
+          errorMessage: err?.message || 'ネットワーク通信エラー',
+          retryInSeconds: 5,
+        });
       } finally {
         setIsLoading(false);
       }
@@ -465,6 +565,7 @@ export default function App() {
       chatHistory,
       gameContext,
       voiceName,
+      memories,
       isObsUrlMode,
       safePostMessage,
     ]
@@ -521,12 +622,12 @@ export default function App() {
   // Avatar Poke Reaction
   const handlePokeAvatar = () => {
     const pokeReplies = [
-      { text: 'ちょ、ちょっと！ゲームに集中して！画面から目を離しちゃダメ！', emotion: 'tsukkomi' as EmotionType },
+      { text: 'ちょ、ちょっとクマ様！集中集中！画面から目を離しちゃダメ！', emotion: 'tsukkomi' as EmotionType },
       { text: 'えへへ、くすぐったいよ〜！そんなにいじるとゲームオーバーになっちゃうよ？', emotion: 'laugh' as EmotionType },
-      { text: 'なに〜？てってなちゃんはいつでも隣でしっかり見てるよ！', emotion: 'happy' as EmotionType },
+      { text: 'なに〜？てってなはいつでもクマ様の隣でしっかり見てるよ！', emotion: 'happy' as EmotionType },
       { text: 'ふふん、さては私の応援パワーが足りなくなってきたんだね！任せなさい！', emotion: 'smug' as EmotionType },
       { text: 'わっ！急につついてきてびっくりしたー！敵かと思ったじゃん！', emotion: 'surprise' as EmotionType },
-      { text: 'もう〜、相棒ったらお茶目なんだから！ほら、次の敵が迫ってきてるよ！', emotion: 'tsukkomi' as EmotionType },
+      { text: 'もう〜、クマ様ったらお茶目なんだから！ほら、次の敵が迫ってきてるよ！', emotion: 'tsukkomi' as EmotionType },
       { text: 'ツンツン禁止ー！…嘘、ちょっと嬉しいかも。さあ、配信盛り上げていこ！', emotion: 'happy' as EmotionType },
     ];
     const picked = pokeReplies[Math.floor(Math.random() * pokeReplies.length)];
@@ -723,6 +824,7 @@ export default function App() {
             isLoading={isLoading}
             gameContext={gameContext}
             onUpdateGameContext={(ctx) => setGameContext((prev) => ({ ...prev, ...ctx }))}
+            onResetGameContext={() => setGameContext(DEFAULT_GAME_CONTEXT)}
             obsSettings={obsSettings}
             onUpdateObsSettings={updateObsSettings}
             chatHistory={chatHistory}
@@ -740,6 +842,11 @@ export default function App() {
             onVoiceNameChange={setVoiceName}
             isQuotaExceeded={isQuotaExceeded}
             isUsingBrowserAudio={isUsingBrowserAudio}
+            memories={memories}
+            onAddMemory={handleAddMemory}
+            onEditMemory={handleEditMemory}
+            onDeleteMemory={handleDeleteMemory}
+            apiStatus={apiStatus}
           />
         </section>
         </div>

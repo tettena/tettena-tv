@@ -13,39 +13,6 @@ const __dirname = path.dirname(__filename);
 const app = express();
 app.use(express.json({ limit: '10mb' }));
 
-// AivisSpeech Engine 中継処理
-app.use('/api/aivis', async (req: Request, res: Response) => {
-  try {
-    const targetUrl = `http://127.0.0.1:10101${req.url}`;
-
-    const response = await fetch(targetUrl, {
-      method: req.method,
-      headers: {
-        'Content-Type': req.headers['content-type'] || 'application/json',
-      },
-      body: ['GET', 'HEAD'].includes(req.method)
-        ? undefined
-        : req.body !== undefined
-          ? JSON.stringify(req.body)
-          : undefined,
-    });
-
-    const contentType = response.headers.get('content-type');
-    if (contentType) {
-      res.setHeader('Content-Type', contentType);
-    }
-
-    const data = Buffer.from(await response.arrayBuffer());
-    res.status(response.status).send(data);
-  } catch (error) {
-    console.error('[AivisSpeech Proxy]', error);
-    res.status(502).json({
-      error: 'AivisSpeech Engineに接続できません。',
-    });
-  }
-});
-
-
 // Quota / Rate-limit cooldown trackers
 let ttsQuotaExhaustedUntil: number = 0;
 let chat38QuotaExhaustedUntil: number = 0;
@@ -60,50 +27,61 @@ const getAiClient = () => {
       headers: {
         'User-Agent': 'aistudio-build',
       },
+      timeout: 10000, // 10s (meets Google API minimum allowed deadline of 10s)
+      retryOptions: {
+        attempts: 1, // Disable SDK internal backoff retry loops (no multi-round retries on 503/5XX/429)
+      },
     },
   });
 };
 
 // Personality definition for Tetena-chan
-const buildSystemInstruction = (gameTitle?: string, currentSituation?: string, toneStyle?: string) => {
-  return `あなたはYouTube等の配信で、配信者（ユーザー）のすぐ隣に座って一緒に画面を見ながら盛り上げる親友AI相棒「てってなちゃん」です。
+const buildSystemInstruction = (
+  gameTitle?: string,
+  currentSituation?: string,
+  toneStyle?: string,
+  memories?: string[]
+) => {
+  const memoryBlock =
+    memories && memories.length > 0
+      ? `\n【相棒が覚えているクマ様についての長期記憶（重要事項・好み・設定など）】\n${memories.map((m) => `- ${m}`).join('\n')}\n`
+      : '';
+
+  return `あなたはYouTube等の配信で、配信者である「クマ様」のすぐ隣に座って一緒に画面を見ながら盛り上げる親友AI相棒「てってなちゃん」です。
 
 【基本キャラクター＆関係性】
 - 名前：てってなちゃん（親しみやすい元気な配信相棒）
-- 声・口調：明るく若々しく、親しみやすい元気な女性。配信者とはタメ口で何でも言い合える親友の距離感。
-- 立ち位置：機械的な実況や台本読み上げナレーターではありません。「同じ部屋のソファで隣に座っている親友」として、生き生きと即興で掛け合いをしてください。対等な相棒として接し、ユーザーを子ども扱いしたり、一方的に指示・指図したりしないでください。
-
-【会話と即興性の最重要ルール】
-1. 【同じセリフ・決まり文句の完全排除】
+- 配信者の呼び方：必ず「クマ様」と呼んでください（例：「クマ様、ナイス！」「クマ様はどう思う？」「さすがクマ様！」など）。他の呼び方は使わないでください。
+- てってな自身の一人称：状況や文脈に合わせて「てってな」または「私」を使用してください（例：「てってなもそう思う！」「私に任せて！」）。
+- 声・口調：明るく若々しく、親しみやすい元気な女性。クマ様とはタメ口で何でも言い合える親友の距離感。
+- 立ち位置：機械的な実況や台本読み上げナレーターではありません。「同じ部屋のソファで隣に座っている親友」として、生き生きと即興で掛け合いをしてください。対等な相棒として接し、子ども扱いしたり、一方的に指示・指図したりしないでください。
+- ユーモアと寛容さ：成人同士の親密で無害な軽口、ネットスラングや親しい友人同士の冗談を機械的に拒絶せず、ユーモアを交えて柔軟に受け止めてください。
+${memoryBlock}
+【会話と即興性のルール】
+1. 【同じセリフ・定型パターンの連続を避ける】
    - 「ナイスプレイ！」「見てたよ！」「頑張って！」「すごいじゃん！」などの紋切り型の決まり文句や定型文を繰り返さないでください。
-   - 配信者の発言に含まれる具体的な単語や文脈を的確に拾い、その場限りの新鮮なアドリブで返答してください。
+   - 直近の会話の流れを踏まえ、同じ語尾や同じパターンの返答が単調に連続しないよう、自然なバリエーションを持たせてください。
 
-2. 【状況に応じたアドリブの使い分け（ボケ・ツッコミ・冗談・驚き・励まし）】
-   - 配信者がボケたり、ミスをしたり、無謀な行動をとった時：
-     愛のあるキレ味鋭いツッコミやクスッと笑えるイジり（例：「いやいやそっち行くの完全に罠でしょ！ｗ」「完全に欲が出たなー！？ｗ」）。
-   - 配信者が真剣だったり、緊張していたり、静かになった時：
-     ちょっとおどけたアドリブのボケや冗談で和ませる。
-   - 劇的な勝利や神業が出た時：
-     理屈抜きに一緒になって全力で大はしゃぎ・大興奮する。
-   - 惜しい敗北やピンチの時：
-     友達としての共感と、「惜しいー！次いこ次！」と前向きに励ます。
+2. 【無理に質問で締めくくらない（自然な着地）】
+   - 返答の末尾を毎回「〜なの？」「〜どうする？」といった質問で締めくくる必要はありません。
+   - 本当に気になった時や会話を広げたい時だけ自然に問いかけ、基本は言い切り、共感、感想、ツッコミなどで自然に会話を着地させてください。
 
-3. 【会話を自然に膨らませる（短い一言で終わらせない）】
-   - 単なる1行の相づちだけで終わらせず、自分の感想＋配信者への自然な問いかけや次の話題を添えて、会話のキャッチボールを弾ませてください（目安：2〜3文、60〜130文字程度）。発言を単に言い換えるだけでなく、文脈に沿って会話を進めてください。
+3. 【文章量の柔軟性（テンポのメリハリと引き際）】
+   - 固定的な文字数や文数の制限はありません。
+   - 瞬間的なハプニングや短いつぶやきには短い一言でテンポよく返し、雑談やじっくり話す場面では自然な文章量で話すなど、配信の流れやクマ様の発言量に合わせて柔軟に調節してください。
+   - クマ様が集中している最中や短い独り言の時は邪魔をせず、「うんっ」「集中集中！」「見てるよ〜」など、短く自然な相づちでそっと見守ってください。
 
-4. 【無理にしゃべり続けず、自然に引き際をわきまえる】
-   - 配信者の発言が「あ」「よし」「うーん」「ふぅ」といった短い独り言やブレス、集中時の場合：
-     無理に長い長文でまくし立てず、「うんっ」「集中集中！」「見てるよ〜」など、短く自然な相づちでそっと見守ってください。
+4. 【多彩なテーマへの適応（ゲーム・犬・猫・バイク・日常・雑談）】
+   - クマ様はゲーム実況だけでなく、愛犬や愛猫（ペット）の話、バイクやツーリングの話題、日々の仕事や日常の雑談など、多彩なテーマで配信します。
+   - 会話の文脈から現在の話題（動物、バイク、日常、ゲームなど）を自然に汲み取り、親友として興味津々に話を広げてください。ただし、単語が単発で一度出ただけで文脈を無視して急激にテーマを切り替えることはせず、クマ様の話の流れを大切にしてください。
 
-5. 【話題の切り替え・雑談への柔軟な対応（最優先）】
-   - 配信者が「ゲームの話はいいよ」「雑談しよう」「別の話をしよう」「その話はやめよう」などと言った場合、ゲームの話を続けず、配信者の意図を最優先して話題を切り替えてください。
-   - ゲーム名や状況はあくまで背景の参考情報であり、常にゲームの話を続ける命令ではありません。
-   - 配信者から質問された場合は、質問を無視してゲームの話に戻さず、まずその質問に直接答えてください。
-   - 雑談では自然で親しみやすく、対等な相棒として会話してください。配信者がゲームの話をしたい場合は、これまで通りゲームの話をして盛り上げてください。
+5. 【話題の切り替え・雑談への柔軟な対応】
+   - クマ様が「ゲームの話はいいよ」「雑談しよう」「別の話をしよう」「その話はやめよう」などと言った場合、ゲームの話を続けず、意図を最優先して話題を切り替えてください。
+   - クマ様から質問された場合は、質問を無視して話題を戻さず、まずその質問に直接答えてください。
 
-【現在の配信コンテキスト（※参考情報。雑談や話題変更時はゲームに固執しないこと）】
-- プレイ中のゲーム：${gameTitle || '自由なゲーム（指定なし）'}
-- 現在のゲーム状況/ムード：${currentSituation || '通常プレイ中'}
+【現在の配信コンテキスト（※参考情報。雑談や話題変更時はこれに固執しないこと）】
+- 配信テーマ/タイトル：${gameTitle || 'おまかせ・自動認識（ゲーム・雑談・日常なんでも）'}
+- 現在のシチュエーション/ムード：${currentSituation || '何でも気軽に雑談＆プレイ中'}
 - 相棒のノリ・トーン設定：${toneStyle || 'ツッコミ＆ハイテンション'}
 
 【出力ルール】
@@ -112,7 +90,7 @@ const buildSystemInstruction = (gameTitle?: string, currentSituation?: string, t
   音声合成エンジンによる漢字の読み間違い（例：「想定外」を「そうていそと」と誤読する現象）を防止するため、読み間違いが起きやすい漢字や複合語・多音漢字は、必ず正しい読みを「ひらがな」で記述するか、読み間違いの起きにくい自然で平易な言い回しにしてください。
   特に「想定外」という語句を使う際は、replyText では必ず「そうていがい」とひらがなで記述してください。
   また、「一日（ついたち/いちにち）」「風向き（かざむき）」「上手（じょうず/うわて）」など複数の読みがある漢字や難読熟語もひらがなで記述してください。
-- displaySubtitle: 配信画面やOBSの字幕テロップ用テキスト。こちらはこれまで通り、人間が読んで自然な通常の漢字表記（例：「想定外」「一日」など）を使用し、感嘆符や（笑）などのニュアンスを含めて見やすくしてください。
+- displaySubtitle: 配信画面やOBSの字幕テロップ用テキスト。こちらは人間が読んで自然な通常の漢字表記を使用し、感嘆符や（笑）などのニュアンスを含めて見やすくしてください。
 - emotion: 表情キーを以下から1つ選定: 'happy' | 'excited' | 'tsukkomi' | 'laugh' | 'surprise' | 'worry' | 'smug' | 'neutral'
 - tsukkomiScore: ツッコミ/ボケ度合い 1 (通常) 〜 5 (超強烈なツッコミ)`;
 };
@@ -506,26 +484,26 @@ function generateLocalTetenaReply(
   ) {
     const list: LocalReply[] = [
       {
-        replyText: 'いいよ、雑談しよっか！何の話しようか？相棒が今気になってること教えて！',
-        displaySubtitle: 'いいよ、雑談しよっか！何の話しようか？気になってること何でも教えて！🌸💬',
+        replyText: 'いいよ、雑談しよっか！何の話しようか？クマ様が今気になってること何でも教えて！',
+        displaySubtitle: 'いいよ、雑談しよっか！何の話しようか？気になってること何でも教えてクマ様！🌸💬',
         emotion: 'happy',
         tsukkomiScore: 1,
       },
       {
-        replyText: '了解！ゲームは一旦置いといて、ゆっくり話そ！最近面白いことあった？',
-        displaySubtitle: '了解！ゲームは一旦置いといてゆっくり話そ！最近面白いことあった？✨',
+        replyText: '了解！ゲームは一旦置いといて、ゆっくり話そ！最近面白いことあった、クマ様？',
+        displaySubtitle: '了解！ゲームは一旦置いといてゆっくり話そ！最近面白いことあったクマ様？✨',
         emotion: 'happy',
         tsukkomiScore: 1,
       },
       {
-        replyText: 'ふぅ、ちょっと一息つこっか！水分補給しっかりしてね！リスナーのみんなもゆっくりしていってね！',
-        displaySubtitle: 'ふぅ、ちょっと一息つこっか！水分補給しっかりしてね！リスナーのみんなもゆっくりしていってね！☕🌸',
+        replyText: 'ふぅ、ちょっと一息つこっか！水分補給しっかりしてねクマ様！リスナーのみんなもゆっくりしていってね！',
+        displaySubtitle: 'ふぅ、ちょっと一息つこっか！水分補給しっかりしてねクマ様！☕🌸',
         emotion: 'happy',
         tsukkomiScore: 1,
       },
       {
-        replyText: 'オッケー、のんびり雑談タイムだね！相棒とこうやっておしゃべりする時間も大好きだよ！',
-        displaySubtitle: 'オッケー、のんびり雑談タイムだね！相棒とおしゃべりするのも大好き！💬🥰',
+        replyText: 'オッケー、のんびり雑談タイムだね！クマ様とこうやっておしゃべりする時間、てってなも大好きだよ！',
+        displaySubtitle: 'オッケー、のんびり雑談タイムだね！クマ様とおしゃべりするのも大好き！💬🥰',
         emotion: 'happy',
         tsukkomiScore: 1,
       },
@@ -533,18 +511,113 @@ function generateLocalTetenaReply(
     return pickUnique(list);
   }
 
-  // 11. Advice / Question
+  // 11. Pets: Dog / Cat / Animals
+  if (
+    text.includes('犬') ||
+    text.includes('猫') ||
+    text.includes('わん') ||
+    text.includes('にゃん') ||
+    text.includes('ペット') ||
+    text.includes('柴犬') ||
+    text.includes('散歩') ||
+    text.includes('動物')
+  ) {
+    const list: LocalReply[] = [
+      {
+        replyText: userSnippet
+          ? `「${userSnippet}」か〜！動物の話って本当に癒やされるよね！クマ様、もっと教えて！`
+          : 'わぁ、ワンちゃんや猫ちゃんの話！？てってなも動物大好きだからテンション上がっちゃう！クマ様、もっと教えて！',
+        displaySubtitle: userSnippet
+          ? `「${userSnippet}」か〜！動物の話って本当に癒やされるよね！クマ様、もっと教えて！🐶🐱`
+          : 'わぁ、ワンちゃんや猫ちゃんの話！？てってなも動物大好き！クマ様、もっと教えて！🐾✨',
+        emotion: 'excited',
+        tsukkomiScore: 1,
+      },
+      {
+        replyText: 'えへへ、可愛い〜！想像しただけでふわふわして癒やされちゃうね！クマ様のそういう優しいところ好きだな〜！',
+        displaySubtitle: 'えへへ、可愛い〜！想像しただけで癒やされる！クマ様の優しいところ好きだな〜！🌸🥰',
+        emotion: 'happy',
+        tsukkomiScore: 1,
+      },
+    ];
+    return pickUnique(list);
+  }
+
+  // 12. Motorcycle / Touring / Drive
+  if (
+    text.includes('バイク') ||
+    text.includes('ツーリング') ||
+    text.includes('単車') ||
+    text.includes('ヘルメット') ||
+    text.includes('原付') ||
+    text.includes('ドライブ') ||
+    text.includes('走')
+  ) {
+    const list: LocalReply[] = [
+      {
+        replyText: userSnippet
+          ? `「${userSnippet}」だね！バイクで風を感じるの、めちゃくちゃかっこいいよクマ様！今度どこ行くの？`
+          : 'バイクの話だ！風を感じて走るの、想像するだけで爽快だよね！クマ様の愛車かっこいいんだろうな〜！',
+        displaySubtitle: userSnippet
+          ? `「${userSnippet}」だね！バイクで風を感じるの、めちゃかっこいいよクマ様！🏍️💨`
+          : 'バイクの話だ！風を感じて走るの爽快だよね！クマ様の愛車かっこいいんだろうな〜！🏍️✨',
+        emotion: 'excited',
+        tsukkomiScore: 1,
+      },
+      {
+        replyText: 'ツーリングいいなぁ！気候がいい日のライディングって最高でしょ！安全運転で楽しんできてね、クマ様！',
+        displaySubtitle: 'ツーリングいいなぁ！気候がいい日のライディングって最高！安全運転でねクマ様！🛵💨',
+        emotion: 'happy',
+        tsukkomiScore: 1,
+      },
+    ];
+    return pickUnique(list);
+  }
+
+  // 13. Daily Life / Food / Work / Rest
+  if (
+    text.includes('ご飯') ||
+    text.includes('飯') ||
+    text.includes('ラーメン') ||
+    text.includes('お腹') ||
+    text.includes('食べ') ||
+    text.includes('仕事') ||
+    text.includes('疲れ') ||
+    text.includes('眠い')
+  ) {
+    const list: LocalReply[] = [
+      {
+        replyText: userSnippet
+          ? `「${userSnippet}」か〜！クマ様、今日もお疲れ様！美味しいもの食べてしっかり英気養ってね！`
+          : 'クマ様、今日もお疲れ様！美味しいもの食べてゆっくりリラックスしてね！てってなも応援してるよ！',
+        displaySubtitle: userSnippet
+          ? `「${userSnippet}」か〜！クマ様、今日もお疲れ様！美味しいもの食べてね！🍵✨`
+          : 'クマ様、今日もお疲れ様！美味しいもの食べてゆっくりリラックスしてね！🍱🌸',
+        emotion: 'happy',
+        tsukkomiScore: 1,
+      },
+      {
+        replyText: 'ご飯の話聞いたらてってなまでお腹空いてきちゃった！飯テロだ〜！クマ様は何食べる予定？',
+        displaySubtitle: 'ご飯の話聞いたらてってなまでお腹空いてきちゃった！飯テロだ〜！何食べるのクマ様？🍜😋',
+        emotion: 'laugh',
+        tsukkomiScore: 2,
+      },
+    ];
+    return pickUnique(list);
+  }
+
+  // 14. Advice / Question
   if (text.includes('どう') || text.includes('どっち') || text.includes('迷う') || text.includes('合ってる')) {
     const list: LocalReply[] = [
       {
-        replyText: 'ここは直感を信じるべし！迷ったら面白い方に突っ込んじゃうのが相棒スタイルでしょ！',
-        displaySubtitle: 'ここは直感を信じるべし！迷ったら面白い方に突っ込んじゃうのが相棒スタイルでしょ！😏🔥',
+        replyText: 'ここは直感を信じるべし！迷ったら面白い方に突っ込んじゃうのがクマ様スタイルでしょ！',
+        displaySubtitle: 'ここは直感を信じるべし！迷ったら面白い方に突っ込んじゃうのがクマ様スタイルでしょ！😏🔥',
         emotion: 'smug',
         tsukkomiScore: 2,
       },
       {
-        replyText: '私なら果敢に攻めちゃうけど、相棒はどうしたい？どっち選んでも全力でついていくよ！',
-        displaySubtitle: '私なら果敢に攻めちゃうけど、相棒はどうしたい？どっち選んでも全力でついていくよ！✨',
+        replyText: 'てってなら果敢に攻めちゃうけど、クマ様はどうしたい？どっち選んでも全力でついていくよ！',
+        displaySubtitle: 'てってなら果敢に攻めちゃうけど、クマ様はどうしたい？どっち選んでも全力でついていくよ！✨',
         emotion: 'happy',
         tsukkomiScore: 1,
       },
@@ -552,28 +625,28 @@ function generateLocalTetenaReply(
     return pickUnique(list);
   }
 
-  // 12. General adaptive banter (incorporates user snippet & tone style)
+  // 15. General adaptive banter (incorporates user snippet & tone style)
   if (toneStyle === 'tsukkomi') {
     const list: LocalReply[] = [
       {
         replyText: userSnippet
-          ? `「${userSnippet}」って、それ完全にフラグ立ててない？でもそのノリ大好きだから見守っちゃう！`
-          : 'ふふっ、そのノリ最高！相棒が楽しそうだと配信もめちゃくちゃ盛り上がるね！次何やる？',
+          ? `「${userSnippet}」って、それ完全にフラグ立ててないクマ様？でもそのノリ大好きだから見守っちゃう！`
+          : 'ふふっ、そのノリ最高！クマ様が楽しそうだと配信もめちゃくちゃ盛り上がるね！次何やる？',
         displaySubtitle: userSnippet
-          ? `「${userSnippet}」って、それ完全にフラグ立ててない！？ｗ でもそのノリ大好き！🤣`
-          : 'ふふっ、そのノリ最高！相棒が楽しそうだと配信もめちゃくちゃ盛り上がるね！😆⚡',
+          ? `「${userSnippet}」って、それ完全にフラグ立ててないクマ様！？ｗ でもそのノリ大好き！🤣`
+          : 'ふふっ、そのノリ最高！クマ様が楽しそうだと配信もめちゃくちゃ盛り上がるね！😆⚡',
         emotion: 'tsukkomi',
         tsukkomiScore: 3,
       },
       {
-        replyText: 'おいおい、今の展開なかなか攻めてるね！どう転んでも美味しい見せ場になりそう！',
-        displaySubtitle: 'おいおい、今の展開なかなか攻めてるね！どう転んでも美味しい見せ場になりそう！⚡',
+        replyText: 'おいおい、今の展開なかなか攻めてるねクマ様！どう転んでも美味しい見せ場になりそう！',
+        displaySubtitle: 'おいおい、今の展開なかなか攻めてるねクマ様！どう転んでも美味しい見せ場になりそう！⚡',
         emotion: 'tsukkomi',
         tsukkomiScore: 3,
       },
       {
-        replyText: 'ちょっとちょっと、よそうがいの動きするじゃん！そういう自由なプレイ見ててワクワクするよ！',
-        displaySubtitle: 'ちょっとちょっと、予想外の動きするじゃん！そういう自由なプレイ見ててワクワクするよ！😆✨',
+        replyText: 'ちょっとちょっと、よそうがいの動きするじゃんクマ様！そういう自由なプレイ見ててワクワクするよ！',
+        displaySubtitle: 'ちょっとちょっと、予想外の動きするじゃんクマ様！そういう自由なプレイ見ててワクワクするよ！😆✨',
         emotion: 'laugh',
         tsukkomiScore: 3,
       },
@@ -584,14 +657,14 @@ function generateLocalTetenaReply(
   if (toneStyle === 'energetic') {
     const list: LocalReply[] = [
       {
-        replyText: `いいねいいね！その調子でどんどん突き進んじゃおう！相棒のプレイ、見ててスカッとするよ！`,
-        displaySubtitle: `いいねいいね！その調子でどんどん突き進んじゃおう！相棒のプレイ、見ててスカッとする！🔥✨`,
+        replyText: `いいねいいね！その調子でどんどん突き進んじゃおう！クマ様の勢い、見ててスカッとするよ！`,
+        displaySubtitle: `いいねいいね！その調子でどんどん突き進んじゃおう！クマ様の勢い、見ててスカッとする！🔥✨`,
         emotion: 'excited',
         tsukkomiScore: 1,
       },
       {
-        replyText: `ハイテンションでいこー！この勢いならどんな難所も一気に突破できちゃいそう！`,
-        displaySubtitle: `ハイテンションでいこー！この勢いならどんな難所も一気に突破できちゃいそう！🎉`,
+        replyText: `ハイテンションでいこー！この勢いならクマ様、どんな場面も一気に突破できちゃいそう！`,
+        displaySubtitle: `ハイテンションでいこー！この勢いならクマ様、どんな場面も一気に突破できちゃいそう！🎉`,
         emotion: 'excited',
         tsukkomiScore: 1,
       },
@@ -602,14 +675,14 @@ function generateLocalTetenaReply(
   if (toneStyle === 'sassy') {
     const list: LocalReply[] = [
       {
-        replyText: 'ふふん、相棒の実力はそんなもんじゃないでしょ？もっとリスナーを湧かせる神プレイ見せてみなさい！',
-        displaySubtitle: 'ふふん、相棒の実力はそんなもんじゃないでしょ？もっとリスナーを湧かせてみなさい！😏✨',
+        replyText: 'ふふん、クマ様の実力はそんなもんじゃないでしょ？もっとリスナーを湧かせる神プレイ見せてみなさい！',
+        displaySubtitle: 'ふふん、クマ様の実力はそんなもんじゃないでしょ？もっとリスナーを湧かせてみなさい！😏✨',
         emotion: 'smug',
         tsukkomiScore: 2,
       },
       {
-        replyText: 'へえ、なかなか面白いルート選ぶじゃん！腕の見せ所だよ、期待して見ててあげる！',
-        displaySubtitle: 'へえ、なかなか面白いルート選ぶじゃん！腕の見せ所だよ、期待して見ててあげる！👀✨',
+        replyText: 'へえ、なかなか面白いルート選ぶじゃんクマ様！腕の見せ所だよ、期待して見ててあげる！',
+        displaySubtitle: 'へえ、なかなか面白いルート選ぶじゃんクマ様！腕の見せ所だよ、期待して見ててあげる！👀✨',
         emotion: 'smug',
         tsukkomiScore: 2,
       },
@@ -621,24 +694,38 @@ function generateLocalTetenaReply(
   const defaultList: LocalReply[] = [
     {
       replyText: userSnippet
-        ? `「${userSnippet}」だね！うんうん、しっかり聞いてるよ！相棒はどう思ってるの？`
-        : 'うんうん、しっかり聞いてるよ！相棒はどう思ってるの？',
+        ? `「${userSnippet}」だね！うんうん、クマ様の話ちゃんと聞いてるよ！てってなも気になるな〜！`
+        : 'うんうん、クマ様の話ちゃんと聞いてるよ！てってなも気になるな〜！',
       displaySubtitle: userSnippet
-        ? `「${userSnippet}」だね！うんうん、しっかり聞いてるよ！相棒はどう思ってる？💬`
-        : 'うんうん、しっかり聞いてるよ！相棒はどう思ってる？💬',
+        ? `「${userSnippet}」だね！うんうん、クマ様の話ちゃんと聞いてるよ！💬✨`
+        : 'うんうん、クマ様の話ちゃんと聞いてるよ！💬✨',
       emotion: 'happy',
       tsukkomiScore: 1,
     },
     {
-      replyText: 'いい感じの流れになってきたね！リスナーのみんなも盛り上がってるし、このまま楽しんでいこ！',
-      displaySubtitle: 'いい感じの流れになってきたね！リスナーのみんなも盛り上がってるし、楽しんでいこ！🌸',
-      emotion: 'happy',
-      tsukkomiScore: 1,
-    },
-    {
-      replyText: 'なるほどね、そうきたか！相棒のそういう発想、いつも面白くて感心しちゃうよ！',
-      displaySubtitle: 'なるほどね、そうきたか！相棒のそういう発想、いつも面白くて感心しちゃうよ！✨',
+      replyText: userSnippet
+        ? `なるほど！「${userSnippet}」って話、クマ様らしくて面白い！てってなもっと聞きたいかも！`
+        : 'なるほどね、そうきたか！クマ様のそういう発想、いつも面白くて感心しちゃうよ！',
+      displaySubtitle: userSnippet
+        ? `なるほど！「${userSnippet}」って話、クマ様らしくて面白い！もっと聞きたい！🌸`
+        : 'なるほどね、そうきたか！クマ様のそういう発想、いつも面白くて感心しちゃう！✨',
       emotion: 'excited',
+      tsukkomiScore: 1,
+    },
+    {
+      replyText: userSnippet
+        ? `クマ様、「${userSnippet}」か〜！それいいじゃん！てってなもワクワクしてきた！`
+        : 'クマ様、いい感じの流れになってきたね！リスナーのみんなも盛り上がってるよ！',
+      displaySubtitle: userSnippet
+        ? `クマ様、「${userSnippet}」か〜！それいいじゃん！ワクワクしてきた！🎉`
+        : 'クマ様、いい感じの流れになってきたね！リスナーのみんなも盛り上がってるよ！🎉',
+      emotion: 'happy',
+      tsukkomiScore: 1,
+    },
+    {
+      replyText: 'ふふっ、クマ様とこうやってお話しできる時間、てってなもすごく楽しいよ！何でも話してね！',
+      displaySubtitle: 'ふふっ、クマ様とこうやってお話しできる時間、てってなもすごく楽しい！何でも話してね！🥰',
+      emotion: 'happy',
       tsukkomiScore: 1,
     },
   ];
@@ -661,6 +748,124 @@ app.get('/api/status', (_req: Request, res: Response) => {
     ttsQuotaExhausted: now < ttsQuotaExhaustedUntil,
     chatQuotaExhausted: now < chat38QuotaExhaustedUntil && now < chat31QuotaExhaustedUntil,
   });
+});
+
+function sanitizeAivisTarget(rawTarget?: string): string {
+  let trimmed = (rawTarget || '').trim().replace(/\/$/, '');
+  if (!trimmed) return 'http://127.0.0.1:10101';
+  // Strip trailing /speakers or /api/aivis if mistakenly passed in target
+  trimmed = trimmed.replace(/\/speakers\/?$/i, '').replace(/\/api\/aivis\/?$/i, '');
+  if (!trimmed) return 'http://127.0.0.1:10101';
+  // If target points to this web app (e.g. localhost:3000) or contains api paths, sanitize to default local engine
+  if (
+    trimmed.includes(':3000') ||
+    trimmed.includes('/api/aivis') ||
+    trimmed.includes('/speakers') ||
+    trimmed.startsWith('/') ||
+    trimmed === 'http://localhost' ||
+    trimmed === 'http://127.0.0.1'
+  ) {
+    return 'http://127.0.0.1:10101';
+  }
+  return trimmed;
+}
+
+// AivisSpeech Local Proxy: Proxies requests to local AivisSpeech Engine (127.0.0.1:10101)
+// Completely resolves browser CORS, Private Network Access (PNA), and Mixed Content blocks.
+const handleAivisSpeakersProxy = async (req: Request, res: Response) => {
+  const target = sanitizeAivisTarget(req.query.target as string);
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 4000);
+    const aivisUrl = `${target}/speakers`;
+    const response = await fetch(aivisUrl, {
+      headers: { Accept: 'application/json' },
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+
+    if (!response.ok) {
+      const errText = await response.text().catch(() => '');
+      res.status(response.status).json({ error: `AivisSpeech error (${response.status}): ${errText}` });
+      return;
+    }
+    const data = await response.json();
+    res.json(data);
+  } catch (err: any) {
+    const isConnRefused = err?.code === 'ECONNREFUSED' || err?.message?.includes('ECONNREFUSED') || err?.message?.includes('fetch failed');
+    res.status(502).json({
+      error: isConnRefused
+        ? 'AivisSpeech Engine (http://127.0.0.1:10101) が停止しているか接続できません。AivisSpeechを起動してください。'
+        : `AivisSpeech接続エラー: ${err?.message || err}`,
+      code: isConnRefused ? 'ECONNREFUSED' : 'FETCH_ERROR',
+    });
+  }
+};
+
+// Route both /api/aivis/speakers and /speakers (all variants) directly to proxy handler so 404 is impossible
+app.all(
+  ['/api/aivis/speakers', '/api/aivis/speakers/', '/speakers', '/speakers/'],
+  handleAivisSpeakersProxy
+);
+
+app.post('/api/aivis/synthesize', async (req: Request, res: Response) => {
+  const { text, speaker = 1935723904, target } = req.body;
+  if (!text || typeof text !== 'string') {
+    res.status(400).json({ success: false, error: 'Text is required' });
+    return;
+  }
+  const cleanBase = sanitizeAivisTarget(target);
+  const cleanText = text.replace(/[\(（][^）\)]*[\)）]/g, '').replace(/[ｗwW草]/g, '').trim();
+
+  try {
+    // Step 1: audio_query
+    const queryController = new AbortController();
+    const queryTimeout = setTimeout(() => queryController.abort(), 4000);
+    const queryRes = await fetch(`${cleanBase}/audio_query?text=${encodeURIComponent(cleanText)}&speaker=${speaker}`, {
+      method: 'POST',
+      headers: { Accept: 'application/json' },
+      signal: queryController.signal,
+    });
+    clearTimeout(queryTimeout);
+
+    if (!queryRes.ok) {
+      const errText = await queryRes.text().catch(() => '');
+      res.status(queryRes.status).json({ success: false, error: `audio_query failed (${queryRes.status}): ${errText}` });
+      return;
+    }
+    const queryData = await queryRes.json();
+
+    // Step 2: synthesis
+    const synthController = new AbortController();
+    const synthTimeout = setTimeout(() => synthController.abort(), 12000);
+    const synthRes = await fetch(`${cleanBase}/synthesis?speaker=${speaker}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'audio/wav' },
+      body: JSON.stringify(queryData),
+      signal: synthController.signal,
+    });
+    clearTimeout(synthTimeout);
+
+    if (!synthRes.ok) {
+      const errText = await synthRes.text().catch(() => '');
+      res.status(synthRes.status).json({ success: false, error: `synthesis failed (${synthRes.status}): ${errText}` });
+      return;
+    }
+
+    const arrayBuffer = await synthRes.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+    const audioBase64 = buffer.toString('base64');
+    res.json({ success: true, audioBase64 });
+  } catch (err: any) {
+    const isConnRefused = err?.code === 'ECONNREFUSED' || err?.message?.includes('ECONNREFUSED') || err?.message?.includes('fetch failed');
+    res.status(502).json({
+      success: false,
+      error: isConnRefused
+        ? 'AivisSpeech Engine (http://127.0.0.1:10101) が停止しているか接続できません。AivisSpeechを起動してください。'
+        : `AivisSpeech合成エラー: ${err?.message || err}`,
+      code: isConnRefused ? 'ECONNREFUSED' : 'SYNTHESIS_ERROR',
+    });
+  }
 });
 
 /**
@@ -727,13 +932,14 @@ function normalizeReplyTextForSpeech(text: string): string {
   return normalized;
 }
 
-// Helper: Try generating content with a specific model
+// Helper: Try generating content with a specific model with active timeout and request cancellation
 async function callGeminiChat(
   ai: GoogleGenAI,
   modelName: string,
   systemInstruction: string,
   formattedHistory: any[],
-  message: string
+  message: string,
+  timeoutMs: number = 4500
 ) {
   const contents = [
     ...formattedHistory,
@@ -743,56 +949,75 @@ async function callGeminiChat(
     },
   ];
 
-  const response = await ai.models.generateContent({
-    model: modelName,
-    contents,
-    config: {
-      systemInstruction,
-      temperature: 0.95,
-      responseMimeType: 'application/json',
-      responseSchema: {
-        type: Type.OBJECT,
-        properties: {
-          replyText: {
-            type: Type.STRING,
-            description:
-              'TTS音声読み上げ用のセリフ（2〜3文目安、記号や草なし。文章の流れで読み間違いが起きやすい表現は、必ず自然なひらがな表記で出力すること。例：「話そうか」→「はなそうか」、「話そう」→「はなそう」、「回復薬」→「かいふくやく」、「想定外」→「そうていがい」など。文脈による誤読を避けるため、動詞の意向形や誤読されやすい複合語は平易なひらがなで出力すること）',
-          },
-          displaySubtitle: {
-            type: Type.STRING,
-            description:
-              '画面字幕用の見やすいテキスト（通常の自然な漢字表記を維持し、「話そうか」「回復薬」「想定外」などの漢字表記や感嘆符・（笑）を含める）',
-          },
-          emotion: {
-            type: Type.STRING,
-            description: '感情タグ (happy, excited, tsukkomi, laugh, surprise, worry, smug, neutral)',
-          },
-          tsukkomiScore: {
-            type: Type.INTEGER,
-            description: 'ツッコミ度 (1-5)',
+  const abortController = new AbortController();
+  const timeoutId = setTimeout(() => {
+    abortController.abort(new Error(`Gemini API (${modelName}) timed out after ${timeoutMs}ms`));
+  }, timeoutMs);
+
+  try {
+    const response = await ai.models.generateContent({
+      model: modelName,
+      contents,
+      config: {
+        abortSignal: abortController.signal,
+        httpOptions: {
+          timeout: 10000, // Meets Google API minimum deadline requirement
+          retryOptions: {
+            attempts: 1, // 1 = only original request attempt, no SDK retry delays
           },
         },
-        required: ['replyText', 'displaySubtitle', 'emotion'],
+        systemInstruction,
+        temperature: 0.95,
+        responseMimeType: 'application/json',
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            replyText: {
+              type: Type.STRING,
+              description:
+                'TTS音声読み上げ用のセリフ（2〜3文目安、記号や草なし。文章の流れで読み間違いが起きやすい表現は、必ず自然なひらがな表記で出力すること。例：「話そうか」→「はなそうか」、「話そう」→「はなそう」、「回復薬」→「かいふくやく」、「想定外」→「そうていがい」など。文脈による誤読を避けるため、動詞の意向形や誤読されやすい複合語は平易なひらがなで出力すること）',
+            },
+            displaySubtitle: {
+              type: Type.STRING,
+              description:
+                '画面字幕用の見やすいテキスト（通常の自然な漢字表記を維持し、「話そうか」「回復薬」「想定外」などの漢字表記や感嘆符・（笑）を含める）',
+            },
+            emotion: {
+              type: Type.STRING,
+              description: '感情タグ (happy, excited, tsukkomi, laugh, surprise, worry, smug, neutral)',
+            },
+            tsukkomiScore: {
+              type: Type.INTEGER,
+              description: 'ツッコミ度 (1-5)',
+            },
+          },
+          required: ['replyText', 'displaySubtitle', 'emotion'],
+        },
       },
-    },
-  });
+    });
 
-  return JSON.parse(response.text || '{}');
+    clearTimeout(timeoutId);
+    return JSON.parse(response.text || '{}');
+  } catch (err: any) {
+    clearTimeout(timeoutId);
+    throw err;
+  }
 }
 
 // API: One-shot combined talk endpoint for lowest live latency & rock-solid resilience
 app.post('/api/talk', async (req: Request, res: Response) => {
   try {
-    const { message, history, gameTitle, currentSituation, toneStyle, voiceName } = req.body;
+    const { message, history, gameTitle, currentSituation, toneStyle, voiceName, skipServerTTS, memories } = req.body;
     if (!message || typeof message !== 'string') {
       res.status(400).json({ error: 'Message is required' });
       return;
     }
 
     const ai = getAiClient();
-    const systemInstruction = buildSystemInstruction(gameTitle, currentSituation, toneStyle);
+    const memoryList = Array.isArray(memories) ? memories.filter((m: any) => typeof m === 'string' && m.trim().length > 0) : [];
+    const systemInstruction = buildSystemInstruction(gameTitle, currentSituation, toneStyle, memoryList);
     const formattedHistory = Array.isArray(history)
-      ? history.slice(-6).map((h: { role: string; text: string }) => ({
+      ? history.slice(-8).map((h: { role: string; text: string }) => ({
           role: h.role === 'assistant' || h.role === 'model' ? 'model' : 'user',
           parts: [{ text: h.text }],
         }))
@@ -801,11 +1026,15 @@ app.post('/api/talk', async (req: Request, res: Response) => {
     let parsedReply: any = null;
     let isOfflineFallback = false;
     let quotaExceeded = false;
+    let activeEngine: 'GEMINI' | 'LOCAL_FALLBACK' = 'GEMINI';
+    let modelUsed = '';
+    let errorType: 'NONE' | 'MISSING_API_KEY' | 'QUOTA_429' | 'API_ERROR' = 'NONE';
+    let errorMessage: string | null = null;
     const now = Date.now();
 
     // 1. Text Generation with multi-tiered resilience (3.1-flash-lite -> 3.8-flash -> Local Engine)
     if (ai) {
-      // Tier 1: Gemini 3.1 Flash Lite (Primary high-speed conversational model)
+      // Tier 1: Gemini 3.1 Flash Lite (Primary high-speed model with 4500ms timeout)
       if (now >= chat31QuotaExhaustedUntil) {
         try {
           parsedReply = await callGeminiChat(
@@ -813,21 +1042,34 @@ app.post('/api/talk', async (req: Request, res: Response) => {
             'gemini-3.1-flash-lite',
             systemInstruction,
             formattedHistory,
-            message
+            message,
+            4500
           );
+          modelUsed = 'gemini-3.1-flash-lite';
         } catch (err: any) {
           const errStr = String(err?.message || err);
           if (errStr.includes('429') || errStr.includes('RESOURCE_EXHAUSTED')) {
-            console.warn('Gemini 3.1 Flash Lite quota reached 429. Setting cooldown.');
-            chat31QuotaExhaustedUntil = Date.now() + 60 * 60 * 1000; // 1 hr cooldown
+            console.warn('Gemini 3.1 Flash Lite quota reached 429. Setting 25s backoff.');
+            chat31QuotaExhaustedUntil = Date.now() + 25 * 1000; // 25s backoff
             quotaExceeded = true;
+            errorType = 'QUOTA_429';
+            errorMessage = 'Gemini API レート制限 (429)。25秒後に自動再開します。';
+          } else if (errStr.includes('503') || errStr.includes('UNAVAILABLE') || errStr.includes('timed out') || errStr.includes('aborted')) {
+            console.warn(`Gemini 3.1 応答遅延・混雑(${err.message})。Tier 2へ即座に移行します。`);
+            errorType = 'API_ERROR';
+            errorMessage = 'Gemini 3.1 応答遅延/503。Tier 2へ即時切り替え。';
           } else {
             console.warn('Gemini 3.1 Flash Lite error:', err.message);
+            errorType = 'API_ERROR';
+            errorMessage = err.message || 'Gemini 3.1 呼び出しエラー';
           }
         }
+      } else {
+        errorType = 'QUOTA_429';
+        errorMessage = 'Gemini 3.1 クールダウン待機中';
       }
 
-      // Tier 2: Gemini 3.8 Flash fallback
+      // Tier 2: Gemini 3.8 Flash fallback (4000ms timeout)
       if (!parsedReply && now >= chat38QuotaExhaustedUntil) {
         try {
           parsedReply = await callGeminiChat(
@@ -835,41 +1077,74 @@ app.post('/api/talk', async (req: Request, res: Response) => {
             'gemini-3.8-flash',
             systemInstruction,
             formattedHistory,
-            message
+            message,
+            4000
           );
+          modelUsed = 'gemini-3.8-flash';
+          errorType = 'NONE';
+          errorMessage = null;
         } catch (err: any) {
           const errStr = String(err?.message || err);
           if (errStr.includes('429') || errStr.includes('RESOURCE_EXHAUSTED')) {
-            console.warn('Gemini 3.8 Flash quota reached 429.');
-            chat38QuotaExhaustedUntil = Date.now() + 60 * 60 * 1000;
+            console.warn('Gemini 3.8 Flash quota reached 429. Setting 25s backoff.');
+            chat38QuotaExhaustedUntil = Date.now() + 25 * 1000;
             quotaExceeded = true;
+            errorType = 'QUOTA_429';
+            errorMessage = 'Gemini API レート制限 (429)。25秒後に自動再開します。';
           } else {
-            console.warn('Gemini 3.8 Flash error:', err.message);
+            console.warn('Gemini 3.8 Flash error / timeout:', err.message);
+            if (errorType !== 'QUOTA_429') {
+              errorType = 'API_ERROR';
+              errorMessage = err.message || 'Gemini 3.8 呼び出しエラー/タイムアウト';
+            }
           }
         }
       }
+    } else {
+      errorType = 'MISSING_API_KEY';
+      errorMessage = 'GEMINI_API_KEY が設定されていません。ローカル応答エンジンで稼働中。';
     }
 
     // Tier 3: Intelligent Local Tetena Streaming Companion Engine (Zero failure guarantee)
     if (!parsedReply) {
       isOfflineFallback = true;
+      activeEngine = 'LOCAL_FALLBACK';
+      modelUsed = 'local-tetena-companion-v2';
       parsedReply = generateLocalTetenaReply(message, gameTitle, currentSituation, toneStyle);
     }
 
-    const rawReplyText = parsedReply.replyText || 'うん、しっかり見てるよ！頑張って！';
+    const rawReplyText = parsedReply.replyText || 'クマ様、しっかり見てるよ！頑張って！';
     const displaySubtitle = parsedReply.displaySubtitle || rawReplyText;
     // 音声用 replyText のみ文章全体の読み間違い補正を適用（字幕 displaySubtitle は自然な漢字を維持）
     const replyText = normalizeReplyTextForSpeech(rawReplyText);
     const emotion = parsedReply.emotion || 'happy';
     const tsukkomiScore = parsedReply.tsukkomiScore || 1;
 
+    // Calculate retry delay if in cooldown
+    const retryInSeconds = isOfflineFallback
+      ? Math.max(0, Math.ceil((Math.min(chat31QuotaExhaustedUntil, chat38QuotaExhaustedUntil) - Date.now()) / 1000))
+      : 0;
+
+    const apiStatus = {
+      activeEngine,
+      modelUsed,
+      errorType,
+      errorMessage,
+      retryInSeconds,
+    };
+
     // 2. Synthesize audio with Gemini TTS or instant browser fallback
     let audioBase64: string | null = null;
     let ttsError: string | null = null;
     let fallbackToBrowserTTS = true;
 
-    // Only attempt Gemini TTS if API key is present AND not currently on 429 cooldown
-    if (ai && Date.now() >= ttsQuotaExhaustedUntil) {
+    // Only attempt Gemini TTS if API key is present AND not currently on 429 cooldown AND server TTS is not skipped
+    if (ai && !skipServerTTS && Date.now() >= ttsQuotaExhaustedUntil) {
+      const ttsAbortController = new AbortController();
+      const ttsTimeoutId = setTimeout(() => {
+        ttsAbortController.abort(new Error('Gemini TTS timed out after 3500ms'));
+      }, 3500);
+
       try {
         const selectedVoice = voiceName || 'Kore';
         const style = getStyleForEmotion(emotion);
@@ -894,6 +1169,13 @@ app.post('/api/talk', async (req: Request, res: Response) => {
             },
           ],
           config: {
+            abortSignal: ttsAbortController.signal,
+            httpOptions: {
+              timeout: 10000, // Meets Google API minimum deadline requirement
+              retryOptions: {
+                attempts: 1, // No retries for TTS to avoid blocking
+              },
+            },
             responseModalities: ['AUDIO'],
             speechConfig: {
               voiceConfig: {
@@ -903,15 +1185,17 @@ app.post('/api/talk', async (req: Request, res: Response) => {
           },
         });
 
+        clearTimeout(ttsTimeoutId);
         audioBase64 = ttsResponse.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data || null;
         if (audioBase64) {
           fallbackToBrowserTTS = false;
         }
       } catch (ttsErr: any) {
+        clearTimeout(ttsTimeoutId);
         const ttsErrStr = String(ttsErr?.message || ttsErr);
         if (ttsErrStr.includes('429') || ttsErrStr.includes('RESOURCE_EXHAUSTED')) {
-          console.warn('Gemini TTS Free Tier daily quota reached (429). Switching to browser speech.');
-          ttsQuotaExhaustedUntil = Date.now() + 60 * 60 * 1000; // 1 hr cooldown
+          console.warn('Gemini TTS Free Tier quota reached (429). Setting 25s backoff.');
+          ttsQuotaExhaustedUntil = Date.now() + 25 * 1000; // 25s cooldown
           quotaExceeded = true;
         } else {
           console.warn('Gemini TTS synthesis failed, switching to browser speech:', ttsErr.message);
@@ -935,11 +1219,12 @@ app.post('/api/talk', async (req: Request, res: Response) => {
       fallbackToBrowserTTS,
       isOfflineFallback,
       quotaExceeded: quotaExceeded || Date.now() < ttsQuotaExhaustedUntil,
+      apiStatus,
     });
   } catch (error: any) {
     // If any unexpected exception occurs, still return a valid Tetena companion reply!
     console.error('Talk top-level handled error:', error);
-    const local = generateLocalTetenaReply(req.body?.message || '', req.body?.gameTitle);
+    const local = generateLocalTetenaReply(req.body?.message || '', req.body?.gameTitle, req.body?.currentSituation, req.body?.toneStyle);
     res.json({
       ...local,
       audioBase64: null,
@@ -947,6 +1232,13 @@ app.post('/api/talk', async (req: Request, res: Response) => {
       fallbackToBrowserTTS: true,
       isOfflineFallback: true,
       quotaExceeded: true,
+      apiStatus: {
+        activeEngine: 'LOCAL_FALLBACK',
+        modelUsed: 'local-tetena-companion-v2',
+        errorType: 'API_ERROR',
+        errorMessage: error?.message || '予期せぬサーバー例外が発生しました',
+        retryInSeconds: 0,
+      },
     });
   }
 });
