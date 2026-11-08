@@ -1,7 +1,7 @@
 /**
  * Japanese Speech Recognition manager for live game streaming.
  * Supports continuous hands-free voice detection and Push-To-Talk (PTT).
- * Provides low-latency real-time interim results without duplication.
+ * Provides low-latency real-time interim results without duplication or concatenation of past utterances.
  */
 
 export interface SpeechRecognitionCallbacks {
@@ -15,7 +15,6 @@ class TetenaSpeechRecognizer {
   private recognition: any = null;
   private isListening: boolean = false;
   private silenceTimer: any = null;
-  private currentUtteranceStartIndex: number = 0;
   private callbacks: SpeechRecognitionCallbacks | null = null;
   private shouldKeepListening: boolean = false;
   private silenceDelayMs: number = 700;
@@ -23,103 +22,135 @@ class TetenaSpeechRecognizer {
   private restartTimeoutId: any = null;
 
   constructor() {
+    this.createRecognition();
+  }
+
+  private createRecognition(): any {
     const SpeechRecognition =
       (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
 
-    if (SpeechRecognition) {
-      this.recognition = new SpeechRecognition();
-      this.recognition.lang = 'ja-JP';
-      this.recognition.continuous = true;
-      this.recognition.interimResults = true;
-      this.recognition.maxAlternatives = 1;
+    if (!SpeechRecognition) return null;
 
-      this.recognition.onstart = () => {
-        this.isListening = true;
-        this.callbacks?.onListeningStateChange(true);
-      };
+    if (this.recognition) {
+      try {
+        this.recognition.onstart = null;
+        this.recognition.onend = null;
+        this.recognition.onerror = null;
+        this.recognition.onresult = null;
+        this.recognition.abort();
+      } catch (_) {}
+    }
 
-      this.recognition.onend = () => {
-        this.isListening = false;
-        this.currentUtteranceStartIndex = 0;
-        
-        // If continuous mode is on, auto-restart with a safe debounce delay
-        if (this.shouldKeepListening) {
-          if (this.restartTimeoutId) clearTimeout(this.restartTimeoutId);
-          this.restartTimeoutId = setTimeout(() => {
-            if (this.shouldKeepListening && this.recognition) {
-              try {
-                this.recognition.start();
-              } catch (e) {
-                // Ignore if already active or user stopped
-              }
-            }
-          }, 250);
+    const rec = new SpeechRecognition();
+    rec.lang = 'ja-JP';
+    rec.continuous = true;
+    rec.interimResults = true;
+    rec.maxAlternatives = 1;
+
+    rec.onstart = () => {
+      this.isListening = true;
+      this.callbacks?.onListeningStateChange(true);
+    };
+
+    rec.onend = () => {
+      this.isListening = false;
+      // Auto-restart in continuous mode if streamer still wants recognition active
+      if (this.shouldKeepListening) {
+        if (this.restartTimeoutId) clearTimeout(this.restartTimeoutId);
+        this.restartTimeoutId = setTimeout(() => {
+          if (this.shouldKeepListening) {
+            this.startListening();
+          }
+        }, 200);
+      } else {
+        this.callbacks?.onListeningStateChange(false);
+      }
+    };
+
+    rec.onerror = (event: any) => {
+      if (event.error === 'no-speech') {
+        // Expected during pause, ignore
+        return;
+      }
+      if (event.error === 'not-allowed') {
+        this.callbacks?.onError('マイクへのアクセスが拒否されました。ブラウザの設定でマイクを許可してください。');
+        this.stop();
+        return;
+      }
+      console.warn('Speech recognition warning:', event.error);
+    };
+
+    rec.onresult = (event: any) => {
+      let finalChunk = '';
+      let interimChunk = '';
+
+      // Read current results for the active utterance
+      for (let i = event.resultIndex; i < event.results.length; ++i) {
+        const item = event.results[i];
+        const transcript = item[0]?.transcript || '';
+        if (item.isFinal) {
+          finalChunk += transcript;
         } else {
-          this.callbacks?.onListeningStateChange(false);
+          interimChunk += transcript;
         }
-      };
+      }
 
-      this.recognition.onerror = (event: any) => {
-        if (event.error === 'no-speech') {
-          // Expected when quiet, ignore
-          return;
-        }
-        if (event.error === 'not-allowed') {
-          this.callbacks?.onError('マイクへのアクセスが拒否されました。ブラウザの設定で許可してください。');
-          this.stop();
-          return;
-        }
-        console.warn('Speech recognition warning:', event.error);
-      };
+      const textChunk = (finalChunk + interimChunk).trim();
+      if (textChunk) {
+        this.latestPendingText = textChunk;
+        this.callbacks?.onInterim(textChunk);
 
-      this.recognition.onresult = (event: any) => {
-        let finalChunk = '';
-        let interimChunk = '';
-
-        const resultsLen = event.results.length;
-        // If results array was cleared or re-indexed by browser, reset start index
-        if (this.currentUtteranceStartIndex > resultsLen) {
-          this.currentUtteranceStartIndex = 0;
+        if (this.silenceTimer) {
+          clearTimeout(this.silenceTimer);
         }
 
-        // Iterate from start index of current sentence
-        for (let i = this.currentUtteranceStartIndex; i < resultsLen; ++i) {
-          const item = event.results[i];
-          const transcript = item[0]?.transcript || '';
-          if (item.isFinal) {
-            finalChunk += transcript;
-          } else {
-            interimChunk += transcript;
-          }
-        }
+        // When user pauses or finishes speaking, finalize sentence
+        this.silenceTimer = setTimeout(() => {
+          this.commitUtterance();
+        }, this.silenceDelayMs);
+      }
+    };
 
-        // Japanese does not use spaces between words: concatenate directly without artificial spaces
-        const currentDisplay = (finalChunk + interimChunk).trim();
+    this.recognition = rec;
+    return rec;
+  }
 
-        if (currentDisplay) {
-          this.latestPendingText = currentDisplay;
+  private commitUtterance() {
+    const fullText = this.latestPendingText.trim();
+    if (fullText.length > 0 && this.callbacks) {
+      const textToSend = fullText;
+      this.latestPendingText = '';
+      this.callbacks.onFinal(textToSend);
+      this.callbacks.onInterim('');
 
-          // Immediately notify frontend of in-progress text so words appear in real time as the user speaks!
-          this.callbacks?.onInterim(currentDisplay);
+      // Restart recognition with a fresh instance to purge Chrome's internal result buffer
+      // and prevent sentences from 2-3 times ago from concatenating into future speech!
+      if (this.shouldKeepListening) {
+        this.restartRecognition();
+      }
+    }
+  }
 
-          // Reset silence timer on any speech detection
-          if (this.silenceTimer) {
-            clearTimeout(this.silenceTimer);
-          }
+  private restartRecognition() {
+    if (this.restartTimeoutId) clearTimeout(this.restartTimeoutId);
+    try {
+      if (this.recognition) {
+        this.recognition.abort();
+      }
+    } catch (_) {}
+    this.createRecognition();
+    this.startListening();
+  }
 
-          // Trigger onFinal when user pauses / finishes speaking
-          this.silenceTimer = setTimeout(() => {
-            const fullText = this.latestPendingText.trim();
-            if (fullText.length > 0) {
-              this.callbacks?.onFinal(fullText);
-              this.callbacks?.onInterim('');
-              this.latestPendingText = '';
-              // Advance index to the end of currently recognized results
-              this.currentUtteranceStartIndex = resultsLen;
-            }
-          }, this.silenceDelayMs);
-        }
-      };
+  private startListening() {
+    if (!this.recognition) {
+      this.createRecognition();
+    }
+    if (!this.recognition) return;
+    try {
+      this.recognition.start();
+    } catch (e) {
+      // Ignore if already active
     }
   }
 
@@ -130,25 +161,25 @@ class TetenaSpeechRecognizer {
   }
 
   public start(callbacks: SpeechRecognitionCallbacks, continuous: boolean = true) {
-    if (!this.recognition) {
+    if (!this.isSupported()) {
       callbacks.onError('お使いのブラウザは音声認識 (Web Speech API) に対応していません。ChromeまたはEdgeをご利用ください。');
       return;
     }
 
     this.callbacks = callbacks;
     this.shouldKeepListening = continuous;
-    this.currentUtteranceStartIndex = 0;
     this.latestPendingText = '';
 
-    try {
-      this.recognition.start();
-    } catch (e) {
-      // If already started, do nothing
-    }
+    this.createRecognition();
+    this.startListening();
   }
 
   public stop() {
     this.shouldKeepListening = false;
+    if (this.restartTimeoutId) {
+      clearTimeout(this.restartTimeoutId);
+      this.restartTimeoutId = null;
+    }
     if (this.silenceTimer) {
       clearTimeout(this.silenceTimer);
       this.silenceTimer = null;
@@ -162,15 +193,24 @@ class TetenaSpeechRecognizer {
       this.callbacks.onInterim('');
     }
 
-    this.currentUtteranceStartIndex = 0;
-
-    if (this.recognition && this.isListening) {
+    if (this.recognition) {
       try {
         this.recognition.stop();
       } catch (e) {
         // Ignored
       }
     }
+    this.isListening = false;
+    this.callbacks?.onListeningStateChange(false);
+  }
+
+  public reset() {
+    if (this.silenceTimer) {
+      clearTimeout(this.silenceTimer);
+      this.silenceTimer = null;
+    }
+    this.latestPendingText = '';
+    this.callbacks?.onInterim('');
   }
 
   public setSilenceDelay(ms: number) {

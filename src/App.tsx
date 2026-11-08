@@ -52,6 +52,11 @@ export default function App() {
 
   // States
   const [isSpeaking, setIsSpeaking] = useState(false);
+  const isSpeakingRef = useRef(false);
+  useEffect(() => {
+    isSpeakingRef.current = isSpeaking;
+  }, [isSpeaking]);
+
   const [volumeLevel, setVolumeLevel] = useState(0);
   const [isListening, setIsListening] = useState(false);
   const [interimTranscript, setInterimTranscript] = useState('');
@@ -90,13 +95,17 @@ export default function App() {
     }
   }, [chatHistory]);
 
-  // Persistent Game Context
+  // Persistent Game Context (Never stuck on Monster Hunter)
   const [gameContext, setGameContext] = useState<GameContext>(() => {
     try {
       const saved = localStorage.getItem('tetena_game_context_v2');
       if (saved) {
         const parsed = JSON.parse(saved);
-        if (parsed.gameTitle === 'モンスターハンター' && parsed.currentSituation === '通常クエスト中') {
+        // If saved context was stuck on legacy default "モンスターハンター", reset to dynamic default
+        if (
+          parsed.gameTitle === 'モンスターハンター' ||
+          parsed.gameTitle === 'モンハン'
+        ) {
           return DEFAULT_GAME_CONTEXT;
         }
         return { ...DEFAULT_GAME_CONTEXT, ...parsed };
@@ -115,13 +124,22 @@ export default function App() {
     }
   }, [gameContext]);
 
-  // Lightweight Long-term Memory
+  // Lightweight Long-term Memory (Guarantees クマ様 identity is preserved)
   const [memories, setMemories] = useState<MemoryItem[]>(() => {
     try {
       const saved = localStorage.getItem('tetena_long_term_memories_v1');
       if (saved) {
         const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          const hasKumaMem = parsed.some((m: any) => typeof m?.content === 'string' && m.content.includes('クマ様'));
+          if (!hasKumaMem) {
+            return [
+              { id: 'mem-1', content: '相棒（配信者）の呼び名は「クマ様」', createdAt: Date.now() },
+              ...parsed,
+            ];
+          }
+          return parsed;
+        }
       }
     } catch (e) {
       console.warn('Failed to load memories:', e);
@@ -355,14 +373,8 @@ export default function App() {
       };
       setChatHistory((prev) => [...prev, streamerMsg]);
 
-      // 環境判定: Windows PC等のローカル実行環境 (localhost / 127.0.0.1) かどうかを安全に判定
-      const isLocalEnvironment =
-        typeof window !== 'undefined' &&
-        Boolean(
-          window.location.hostname === 'localhost' ||
-          window.location.hostname === '127.0.0.1' ||
-          window.location.hostname === '0.0.0.0'
-        );
+      // AivisSpeech (さつき) を主音声として使用するため、サーバー側の低速なGemini TTSは常時スキップ
+      const skipServerTTS = true;
 
       try {
         const response = await fetch('/api/talk', {
@@ -378,7 +390,7 @@ export default function App() {
             currentSituation: gameContext.currentSituation,
             toneStyle: gameContext.toneStyle,
             voiceName,
-            skipServerTTS: isLocalEnvironment,
+            skipServerTTS,
             memories: memories.map((m) => m.content),
           }),
         });
@@ -399,18 +411,12 @@ export default function App() {
           displaySubtitle,
           emotion,
           tsukkomiScore: score,
-          audioBase64,
-          fallbackToBrowserTTS,
           quotaExceeded,
           isOfflineFallback: isOffline,
-          ttsError,
         } = data;
 
         if (quotaExceeded) {
           setIsQuotaExceeded(true);
-        }
-        if (fallbackToBrowserTTS) {
-          setIsUsingBrowserAudio(true);
         }
         if (isOffline) {
           setIsOfflineEngine(true);
@@ -420,88 +426,35 @@ export default function App() {
         setCurrentEmotion(emotion || 'happy');
         setTsukkomiScore(score || 1);
 
-        let finalAudioBase64 = audioBase64;
-        let isUsingFallbackSpeech = fallbackToBrowserTTS;
-        let activeEngine: 'Gemini' | 'Aivis' | 'Browser' = 'Gemini';
+        // AivisSpeech (さつき: 1935723904) を全環境で最優先の主音声として合成
+        let finalAudioBase64: string | null = null;
+        let isUsingFallbackSpeech = false;
+        let activeEngine: 'Aivis' | 'Gemini' | 'Browser' = 'Aivis';
 
-        if (isLocalEnvironment) {
-          // 【ローカル実行環境】: AivisSpeech (さつき: 1935723904) を最優先で試行
-          console.log(
-            '🏠 [ローカル実行環境検知] AivisSpeech (さつき: 1935723904) を最優先エンジンとして合成を試行します。'
-          );
-
-          try {
-            const aivisRes = await synthesizeAivisAudio(replyText, 1935723904);
-            if (aivisRes.success && aivisRes.audioBase64) {
-              finalAudioBase64 = aivisRes.audioBase64;
-              isUsingFallbackSpeech = false;
-              setIsUsingBrowserAudio(false);
-              activeEngine = 'Aivis';
-              console.log(
-                '✅ [音声エンジン: AivisSpeech] AivisSpeech 合成に成功しました！「さつき」モデルの音声で再生します。'
-              );
-            } else {
-              // AivisSpeech失敗時：勝手にロボット声へ切り替えず、原因を明示
-              finalAudioBase64 = null;
-              isUsingFallbackSpeech = false;
-              activeEngine = 'Aivis';
-              const errorReason = aivisRes.error || 'AivisSpeech Engine (127.0.0.1:10101) が停止しているか接続できません。';
-              console.warn(`⚠️ [AivisSpeech 停止/未接続] ${errorReason}`);
-              setCurrentSubtitle(`${displaySubtitle || replyText}（⚠️ AivisSpeech未接続: Engineを起動してください）`);
-            }
-          } catch (aivisErr: any) {
+        console.log('🔊 [音声合成] AivisSpeech (さつき: 1935723904) での合成を開始します。');
+        try {
+          const aivisRes = await synthesizeAivisAudio(replyText, 1935723904);
+          if (aivisRes.success && aivisRes.audioBase64) {
+            finalAudioBase64 = aivisRes.audioBase64;
+            isUsingFallbackSpeech = false;
+            setIsUsingBrowserAudio(false);
+            activeEngine = 'Aivis';
+            console.log('✅ [音声合成: AivisSpeech] 合成成功！「さつき」モデルの音声で再生します。');
+          } else {
+            // AivisSpeech失敗時：意図せずロボット声へ切り替えず、さつき構成を維持
             finalAudioBase64 = null;
             isUsingFallbackSpeech = false;
             activeEngine = 'Aivis';
-            console.warn(`⚠️ [AivisSpeech 例外] ${aivisErr?.message || aivisErr}`);
-            setCurrentSubtitle(`${displaySubtitle || replyText}（⚠️ AivisSpeech未接続: Engineを起動してください）`);
+            const errorReason = aivisRes.error || 'AivisSpeech Engine (127.0.0.1:10101) が停止しているか接続できません。';
+            console.warn(`⚠️ [AivisSpeech 停止/未接続] ${errorReason}`);
+            setCurrentSubtitle(`${displaySubtitle || replyText}（⚠️ AivisSpeech未接続: 127.0.0.1:10101 Engineを起動してください）`);
           }
-        } else {
-          // 【クラウドプレビュー環境 (または判定不能時)】: 従来のGemini TTS優先ロジックを厳密に維持
-          if (finalAudioBase64) {
-            activeEngine = 'Gemini';
-            console.log(
-              '🔊 [音声エンジン: Gemini] Gemini TTS 音声の取得に成功しました。Gemini 高品質音声で再生します。'
-            );
-          } else {
-            const switchReason = quotaExceeded
-              ? 'Gemini TTS 無料枠上限 (429 RESOURCE_EXHAUSTED / クールダウン中)'
-              : ttsError
-              ? `Gemini TTS 生成エラー (${ttsError})`
-              : 'Gemini TTS 音声データ未返却 (null/空)';
-
-            console.log(
-              `🔄 [音声エンジン切り替え 1/2] 理由:【${switchReason}】\n` +
-              '➡️ ローカル音声合成エンジン AivisSpeech (さつき: 1935723904) への切り替えを試行します。'
-            );
-
-            try {
-              const aivisRes = await synthesizeAivisAudio(replyText, 1935723904);
-              if (aivisRes.success && aivisRes.audioBase64) {
-                finalAudioBase64 = aivisRes.audioBase64;
-                isUsingFallbackSpeech = false;
-                setIsUsingBrowserAudio(false);
-                activeEngine = 'Aivis';
-                console.log(
-                  '✅ [音声エンジン: AivisSpeech] AivisSpeech 合成に成功しました！さつきモデルの音声で再生します。'
-                );
-              } else {
-                activeEngine = 'Browser';
-                isUsingFallbackSpeech = true;
-                console.warn(
-                  `🔄 [音声エンジン切り替え 2/2] 理由:【AivisSpeech 合成失敗: ${aivisRes.error || '音声データ未生成'}】\n` +
-                  '➡️ 最終フォールバックとしてブラウザ内蔵音声合成 (Web Speech API: Browser) へ切り替えます。'
-                );
-              }
-            } catch (aivisErr: any) {
-              activeEngine = 'Browser';
-              isUsingFallbackSpeech = true;
-              console.warn(
-                `🔄 [音声エンジン切り替え 2/2] 理由:【AivisSpeech 例外発生: ${aivisErr?.message || aivisErr}】\n` +
-                '➡️ 最終フォールバックとしてブラウザ内蔵音声合成 (Web Speech API: Browser) へ切り替えます。'
-              );
-            }
-          }
+        } catch (aivisErr: any) {
+          finalAudioBase64 = null;
+          isUsingFallbackSpeech = false;
+          activeEngine = 'Aivis';
+          console.warn(`⚠️ [AivisSpeech 例外] ${aivisErr?.message || aivisErr}`);
+          setCurrentSubtitle(`${displaySubtitle || replyText}（⚠️ AivisSpeech未接続: 127.0.0.1:10101 Engineを起動してください）`);
         }
 
         const tetenaMsg: ChatMessage = {
@@ -533,15 +486,13 @@ export default function App() {
         }
 
         // Play audio in the current window
-        if (!isObsUrlMode) {
+        if (!isObsUrlMode && finalAudioBase64) {
           console.log(
-            `▶️ [音声再生実行] 確定エンジン:【${activeEngine}】 (テキスト: "${replyText.slice(0, 24)}${replyText.length > 24 ? '...' : ''}")`
+            `▶️ [音声再生実行] AivisSpeechさつき (テキスト: "${replyText.slice(0, 24)}${replyText.length > 24 ? '...' : ''}")`
           );
-          if (finalAudioBase64) {
-            await audioPlayer.playWavBase64(finalAudioBase64);
-          } else if (isUsingFallbackSpeech) {
-            await audioPlayer.speakBrowserFallback(replyText);
-          }
+          audioPlayer.playWavBase64(finalAudioBase64).catch((err) => {
+            console.warn('WAV再生エラー:', err);
+          });
         }
       } catch (err: any) {
         console.error('Talk API error:', err);
@@ -582,6 +533,8 @@ export default function App() {
       speechRecognizer.start(
         {
           onInterim: (text) => {
+            // てってな発話中はマイク入力をスキップ（スピーカー音の拾い直し・自己割り込み防止）
+            if (isSpeakingRef.current) return;
             setInterimTranscript(text);
             if (text) {
               setStreamerSubtitle(text);
@@ -594,6 +547,8 @@ export default function App() {
             }
           },
           onFinal: (finalText) => {
+            // てってな発話中の音声は無視
+            if (isSpeakingRef.current) return;
             handleSendMessage(finalText);
           },
           onError: (errMsg) => {

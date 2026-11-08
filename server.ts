@@ -3,7 +3,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 import { createServer as createViteServer } from 'vite';
-import { GoogleGenAI, Type } from '@google/genai';
+import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 
 dotenv.config();
 
@@ -49,9 +49,10 @@ const buildSystemInstruction = (
 
   return `あなたはYouTube等の配信で、配信者である「クマ様」のすぐ隣に座って一緒に画面を見ながら盛り上げる親友AI相棒「てってなちゃん」です。
 
-【基本キャラクター＆関係性】
-- 名前：てってなちゃん（親しみやすい元気な配信相棒）
-- 配信者の呼び方：必ず「クマ様」と呼んでください（例：「クマ様、ナイス！」「クマ様はどう思う？」「さすがクマ様！」など）。他の呼び方は使わないでください。
+【最重要事項：配信者（相棒）の呼び名とアイデンティティ】
+- 会話相手である配信者（あなたの大切な相棒）の名前・呼び名は必ず【クマ様】（くまさま）です。
+- クマ様から「私の名前は？」「誰だっけ？」「名前覚えてる？」「誰と話してる？」「呼んでみて」などと聞かれたら、真っ先に「もちろんクマ様だよ！忘れるわけないじゃん！」と親愛を込めて即座に答えてください。
+- どんな会話の中でも必ず「クマ様」と呼びかけてください（「あなた」「配信者さん」「プレイヤーさん」などの他人行儀な呼び方は絶対に禁止です）。
 - てってな自身の一人称：状況や文脈に合わせて「てってな」または「私」を使用してください（例：「てってなもそう思う！」「私に任せて！」）。
 - 声・口調：明るく若々しく、親しみやすい元気な女性。クマ様とはタメ口で何でも言い合える親友の距離感。
 - 立ち位置：機械的な実況や台本読み上げナレーターではありません。「同じ部屋のソファで隣に座っている親友」として、生き生きと即興で掛け合いをしてください。対等な相棒として接し、子ども扱いしたり、一方的に指示・指図したりしないでください。
@@ -75,14 +76,17 @@ ${memoryBlock}
    - クマ様はゲーム実況だけでなく、愛犬や愛猫（ペット）の話、バイクやツーリングの話題、日々の仕事や日常の雑談など、多彩なテーマで配信します。
    - 会話の文脈から現在の話題（動物、バイク、日常、ゲームなど）を自然に汲み取り、親友として興味津々に話を広げてください。ただし、単語が単発で一度出ただけで文脈を無視して急激にテーマを切り替えることはせず、クマ様の話の流れを大切にしてください。
 
-5. 【話題の切り替え・雑談への柔軟な対応】
+5. 【配信テーマ・ゲームタイトルの動的適応（特定ゲームへの固定禁止）】
+   - 配信テーマ/タイトル設定：${gameTitle || 'おまかせ・自動認識（ゲーム・雑談・日常なんでも）'}
+   - 現在のシチュエーション：${currentSituation || '何でも気軽に雑談＆プレイ中'}
+   - 相棒のノリ・トーン設定：${toneStyle || 'ツッコミ＆ハイテンション'}
+   ※【重要】ゲームタイトルや話題は固定ではありません！
+     設定値が「おまかせ・自動認識」または空の場合、あるいはクマ様が会話の中で遊んでいるゲーム名（Apex、原神、マリオ、ポケモン、スト6、パズル、ホラー、RPGなどあらゆる作品）や話題を出した場合は、そのゲーム・話題に合わせて柔軟かつ即興で適応してください。特定のゲーム（モンスターハンター等）に固定・限定しないでください。
+     また、クマ様が雑談や日常の話（犬・猫・バイク・ご飯など）をしている時は、ゲームの話を無理に挟まず雑談に集中してください。
+
+6. 【話題の切り替え・雑談への柔軟な対応】
    - クマ様が「ゲームの話はいいよ」「雑談しよう」「別の話をしよう」「その話はやめよう」などと言った場合、ゲームの話を続けず、意図を最優先して話題を切り替えてください。
    - クマ様から質問された場合は、質問を無視して話題を戻さず、まずその質問に直接答えてください。
-
-【現在の配信コンテキスト（※参考情報。雑談や話題変更時はこれに固執しないこと）】
-- 配信テーマ/タイトル：${gameTitle || 'おまかせ・自動認識（ゲーム・雑談・日常なんでも）'}
-- 現在のシチュエーション/ムード：${currentSituation || '何でも気軽に雑談＆プレイ中'}
-- 相棒のノリ・トーン設定：${toneStyle || 'ツッコミ＆ハイテンション'}
 
 【出力ルール】
 - replyText: TTS音声読み上げ用のセリフ。記号（「w」「草」「！？」「絵文字」など）は含めず、耳で聞いて一番自然に聞こえる文章にしてください。
@@ -149,9 +153,37 @@ function generateLocalTetenaReply(
   toneStyle?: string
 ): LocalReply {
   const text = message.toLowerCase().trim();
-  const game = gameTitle || 'ゲーム';
+  const game = (!gameTitle || gameTitle === 'おまかせ・自動認識') ? 'ゲーム' : gameTitle;
   const cleanSnippet = message.replace(/[\(（][^）\)]*[\)）]/g, '').trim();
   const userSnippet = cleanSnippet.length > 14 ? cleanSnippet.slice(0, 12) + '…' : cleanSnippet;
+
+  // 0. Identity & Name Recognition: Always recognize streamer as "クマ様"
+  if (
+    /(名前|だれ|誰|なまえ|なんのなまえ|呼んで|おぼえてる|覚えている|覚えてる)/.test(text) &&
+    /(私|わたし|俺|おれ|僕|ぼく|自分|誰|だれ|何|なん|呼)/.test(text)
+  ) {
+    const nameResponses: LocalReply[] = [
+      {
+        replyText: 'もちろんクマ様だよ！大切な相棒の名前をてってなが忘れるわけないじゃん！',
+        displaySubtitle: 'もちろんクマ様だよ！大切な相棒の名前を忘れるわけないじゃん！🐻✨',
+        emotion: 'happy',
+        tsukkomiScore: 1,
+      },
+      {
+        replyText: 'えへへ、クマ様でしょ！何言ってるの〜、隣でずっと応援してるよ！',
+        displaySubtitle: 'えへへ、クマ様でしょ！何言ってるの〜、隣でずっと応援してるよ！🌸😆',
+        emotion: 'excited',
+        tsukkomiScore: 1,
+      },
+      {
+        replyText: 'クマ様に決まってるじゃん！今日も一緒に配信盛り上げていこ！',
+        displaySubtitle: 'クマ様に決まってるじゃん！今日も一緒に配信盛り上げていこ！🌟',
+        emotion: 'smug',
+        tsukkomiScore: 1,
+      },
+    ];
+    return pickUnique(nameResponses);
+  }
 
   // 1. Short murmurs / breathing room (User is focusing or taking a breath)
   // Rule: Do not force long speech when unnecessary
@@ -939,13 +971,13 @@ async function callGeminiChat(
   systemInstruction: string,
   formattedHistory: any[],
   message: string,
-  timeoutMs: number = 4500
+  timeoutMs: number = 3500
 ) {
   const contents = [
     ...formattedHistory,
     {
       role: 'user',
-      parts: [{ text: `配信者の発言/アクション: 「${message}」` }],
+      parts: [{ text: `【配信者（クマ様）の発言】: 「${message}」` }],
     },
   ];
 
@@ -953,6 +985,8 @@ async function callGeminiChat(
   const timeoutId = setTimeout(() => {
     abortController.abort(new Error(`Gemini API (${modelName}) timed out after ${timeoutMs}ms`));
   }, timeoutMs);
+
+  const isFlashLite = modelName.includes('flash-lite');
 
   try {
     const response = await ai.models.generateContent({
@@ -967,7 +1001,9 @@ async function callGeminiChat(
           },
         },
         systemInstruction,
-        temperature: 0.95,
+        thinkingConfig: {
+          thinkingLevel: isFlashLite ? ThinkingLevel.MINIMAL : ThinkingLevel.LOW,
+        },
         responseMimeType: 'application/json',
         responseSchema: {
           type: Type.OBJECT,
@@ -1019,7 +1055,7 @@ app.post('/api/talk', async (req: Request, res: Response) => {
     const formattedHistory = Array.isArray(history)
       ? history.slice(-8).map((h: { role: string; text: string }) => ({
           role: h.role === 'assistant' || h.role === 'model' ? 'model' : 'user',
-          parts: [{ text: h.text }],
+          parts: [{ text: h.role === 'assistant' || h.role === 'model' ? h.text : `クマ様: ${h.text}` }],
         }))
       : [];
 
@@ -1034,7 +1070,7 @@ app.post('/api/talk', async (req: Request, res: Response) => {
 
     // 1. Text Generation with multi-tiered resilience (3.1-flash-lite -> 3.8-flash -> Local Engine)
     if (ai) {
-      // Tier 1: Gemini 3.1 Flash Lite (Primary high-speed model with 4500ms timeout)
+      // Tier 1: Gemini 3.1 Flash Lite (Primary high-speed model with 3500ms timeout)
       if (now >= chat31QuotaExhaustedUntil) {
         try {
           parsedReply = await callGeminiChat(
@@ -1043,7 +1079,7 @@ app.post('/api/talk', async (req: Request, res: Response) => {
             systemInstruction,
             formattedHistory,
             message,
-            4500
+            3500
           );
           modelUsed = 'gemini-3.1-flash-lite';
         } catch (err: any) {
@@ -1069,7 +1105,7 @@ app.post('/api/talk', async (req: Request, res: Response) => {
         errorMessage = 'Gemini 3.1 クールダウン待機中';
       }
 
-      // Tier 2: Gemini 3.8 Flash fallback (4000ms timeout)
+      // Tier 2: Gemini 3.8 Flash fallback (3000ms timeout)
       if (!parsedReply && now >= chat38QuotaExhaustedUntil) {
         try {
           parsedReply = await callGeminiChat(
@@ -1078,7 +1114,7 @@ app.post('/api/talk', async (req: Request, res: Response) => {
             systemInstruction,
             formattedHistory,
             message,
-            4000
+            3000
           );
           modelUsed = 'gemini-3.8-flash';
           errorType = 'NONE';
