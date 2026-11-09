@@ -141,9 +141,35 @@ export async function synthesizeAivisAudio(
       return { success: false, error: 'Empty text' };
     }
 
+    // Fast-path: Single round-trip synthesis endpoint
+    try {
+      const fastController = new AbortController();
+      const fastTimeout = setTimeout(() => fastController.abort(), 12000);
+      const fastRes = await fetch('/api/aivis/synthesize', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify({
+          text: cleanText,
+          speaker: styleId,
+          target: cleanBase,
+        }),
+        signal: fastController.signal,
+      });
+      clearTimeout(fastTimeout);
+
+      if (fastRes.ok) {
+        const fastData = await fastRes.json();
+        if (fastData.success && fastData.audioBase64) {
+          return { success: true, audioBase64: fastData.audioBase64 };
+        }
+      }
+    } catch (_) {
+      // Fallback to two-step audio_query + synthesis
+    }
+
     // Step 1: audio_query
     activeStep = 'audio_query';
-    const queryUrl = `/api/aivis/audio_query?text=${encodeURIComponent(cleanText)}&speaker=${styleId}`;
+    const queryUrl = `/api/aivis/audio_query?text=${encodeURIComponent(cleanText)}&speaker=${styleId}&target=${encodeURIComponent(cleanBase)}`;
     const queryHeaders = {
       Accept: 'application/json',
     };
@@ -198,7 +224,7 @@ export async function synthesizeAivisAudio(
 
     // Step 2: synthesis
     activeStep = 'synthesis';
-    const synthUrl = `/api/aivis/synthesis?speaker=${styleId}`;
+    const synthUrl = `/api/aivis/synthesis?speaker=${styleId}&target=${encodeURIComponent(cleanBase)}`;
     const synthHeaders = {
       'Content-Type': 'application/json',
       Accept: 'audio/wav',

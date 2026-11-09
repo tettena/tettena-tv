@@ -17,8 +17,9 @@ class TetenaSpeechRecognizer {
   private silenceTimer: any = null;
   private callbacks: SpeechRecognitionCallbacks | null = null;
   private shouldKeepListening: boolean = false;
-  private silenceDelayMs: number = 700;
+  private silenceDelayMs: number = 1200;
   private latestPendingText: string = '';
+  private currentUtteranceStartIndex: number = 0;
   private restartTimeoutId: any = null;
 
   constructor() {
@@ -54,6 +55,7 @@ class TetenaSpeechRecognizer {
 
     rec.onend = () => {
       this.isListening = false;
+      this.currentUtteranceStartIndex = 0;
       // Auto-restart in continuous mode if streamer still wants recognition active
       if (this.shouldKeepListening) {
         if (this.restartTimeoutId) clearTimeout(this.restartTimeoutId);
@@ -84,8 +86,13 @@ class TetenaSpeechRecognizer {
       let finalChunk = '';
       let interimChunk = '';
 
-      // Read current results for the active utterance
-      for (let i = event.resultIndex; i < event.results.length; ++i) {
+      const len = event.results.length;
+      if (this.currentUtteranceStartIndex > len) {
+        this.currentUtteranceStartIndex = 0;
+      }
+
+      // Read all results from current sentence start index so earlier chunks are never discarded!
+      for (let i = this.currentUtteranceStartIndex; i < len; ++i) {
         const item = event.results[i];
         const transcript = item[0]?.transcript || '';
         if (item.isFinal) {
@@ -104,9 +111,9 @@ class TetenaSpeechRecognizer {
           clearTimeout(this.silenceTimer);
         }
 
-        // When user pauses or finishes speaking, finalize sentence
+        // When user pauses or finishes speaking, finalize sentence without prematurely cutting off
         this.silenceTimer = setTimeout(() => {
-          this.commitUtterance();
+          this.commitUtterance(len);
         }, this.silenceDelayMs);
       }
     };
@@ -115,19 +122,16 @@ class TetenaSpeechRecognizer {
     return rec;
   }
 
-  private commitUtterance() {
+  private commitUtterance(nextStartIndex?: number) {
     const fullText = this.latestPendingText.trim();
     if (fullText.length > 0 && this.callbacks) {
       const textToSend = fullText;
       this.latestPendingText = '';
+      if (typeof nextStartIndex === 'number') {
+        this.currentUtteranceStartIndex = nextStartIndex;
+      }
       this.callbacks.onFinal(textToSend);
       this.callbacks.onInterim('');
-
-      // Restart recognition with a fresh instance to purge Chrome's internal result buffer
-      // and prevent sentences from 2-3 times ago from concatenating into future speech!
-      if (this.shouldKeepListening) {
-        this.restartRecognition();
-      }
     }
   }
 
@@ -146,13 +150,14 @@ class TetenaSpeechRecognizer {
     if (!this.recognition) {
       this.createRecognition();
     }
-    if (!this.recognition) return;
+    if (!this.recognition || this.isListening) return;
     try {
       this.recognition.start();
     } catch (e) {
       // Ignore if already active
     }
   }
+
 
   public isSupported(): boolean {
     return Boolean(
@@ -169,6 +174,7 @@ class TetenaSpeechRecognizer {
     this.callbacks = callbacks;
     this.shouldKeepListening = continuous;
     this.latestPendingText = '';
+    this.currentUtteranceStartIndex = 0;
 
     this.createRecognition();
     this.startListening();
@@ -176,6 +182,7 @@ class TetenaSpeechRecognizer {
 
   public stop() {
     this.shouldKeepListening = false;
+    this.currentUtteranceStartIndex = 0;
     if (this.restartTimeoutId) {
       clearTimeout(this.restartTimeoutId);
       this.restartTimeoutId = null;

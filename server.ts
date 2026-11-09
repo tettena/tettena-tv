@@ -840,6 +840,92 @@ app.all(
   handleAivisSpeakersProxy
 );
 
+// Proxy for AivisSpeech audio_query (handles query params text & speaker, plus target)
+app.all(
+  ['/api/aivis/audio_query', '/api/aivis/audio_query/', '/audio_query', '/audio_query/'],
+  async (req: Request, res: Response) => {
+    const rawText = (req.query.text as string) || (req.body?.text as string) || '';
+    const speaker = req.query.speaker || req.body?.speaker || 1935723904;
+    const target = (req.query.target as string) || req.body?.target;
+    const cleanBase = sanitizeAivisTarget(target);
+    const cleanText = rawText.replace(/[\(（][^）\)]*[\)）]/g, '').replace(/[ｗwW草]/g, '').trim();
+
+    if (!cleanText) {
+      res.status(400).json({ error: 'text is required' });
+      return;
+    }
+
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 6000);
+      const queryUrl = `${cleanBase}/audio_query?text=${encodeURIComponent(cleanText)}&speaker=${speaker}`;
+      const queryRes = await fetch(queryUrl, {
+        method: 'POST',
+        headers: { Accept: 'application/json' },
+        signal: controller.signal,
+      });
+      clearTimeout(timeoutId);
+
+      if (!queryRes.ok) {
+        const errText = await queryRes.text().catch(() => '');
+        res.status(queryRes.status).json({ error: `audio_query failed (${queryRes.status}): ${errText}` });
+        return;
+      }
+      const data = await queryRes.json();
+      res.json(data);
+    } catch (err: any) {
+      const isConnRefused = err?.code === 'ECONNREFUSED' || err?.message?.includes('ECONNREFUSED') || err?.message?.includes('fetch failed');
+      res.status(502).json({
+        error: isConnRefused
+          ? 'AivisSpeech Engine (http://127.0.0.1:10101) が停止しているか接続できません。'
+          : `audio_query error: ${err?.message || err}`,
+        code: isConnRefused ? 'ECONNREFUSED' : 'AUDIO_QUERY_ERROR',
+      });
+    }
+  }
+);
+
+// Proxy for AivisSpeech synthesis (takes queryData JSON body and returns audio/wav binary)
+app.all(
+  ['/api/aivis/synthesis', '/api/aivis/synthesis/', '/synthesis', '/synthesis/'],
+  async (req: Request, res: Response) => {
+    const speaker = req.query.speaker || req.body?.speaker || 1935723904;
+    const target = (req.query.target as string) || req.body?.target;
+    const cleanBase = sanitizeAivisTarget(target);
+
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 15000);
+      const synthUrl = `${cleanBase}/synthesis?speaker=${speaker}`;
+      const synthRes = await fetch(synthUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'audio/wav' },
+        body: JSON.stringify(req.body),
+        signal: controller.signal,
+      });
+      clearTimeout(timeoutId);
+
+      if (!synthRes.ok) {
+        const errText = await synthRes.text().catch(() => '');
+        res.status(synthRes.status).json({ error: `synthesis failed (${synthRes.status}): ${errText}` });
+        return;
+      }
+
+      res.setHeader('Content-Type', 'audio/wav');
+      const arrayBuffer = await synthRes.arrayBuffer();
+      res.send(Buffer.from(arrayBuffer));
+    } catch (err: any) {
+      const isConnRefused = err?.code === 'ECONNREFUSED' || err?.message?.includes('ECONNREFUSED') || err?.message?.includes('fetch failed');
+      res.status(502).json({
+        error: isConnRefused
+          ? 'AivisSpeech Engine (http://127.0.0.1:10101) が停止しているか接続できません。'
+          : `synthesis error: ${err?.message || err}`,
+        code: isConnRefused ? 'ECONNREFUSED' : 'SYNTHESIS_ERROR',
+      });
+    }
+  }
+);
+
 app.post('/api/aivis/synthesize', async (req: Request, res: Response) => {
   const { text, speaker = 1935723904, target } = req.body;
   if (!text || typeof text !== 'string') {
