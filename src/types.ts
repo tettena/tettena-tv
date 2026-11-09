@@ -40,3 +40,18 @@ export interface TetenaSyncEvent {
   type: 'NEW_REPLY' | 'SPEAKING_STATE' | 'SETTINGS_UPDATE' | 'STREAMER_TALKING';
   payload: any;
 }
+
+export interface MemoryItem {
+  id: string;
+  content: string;
+  createdAt: number;
+}
+
+export interface ApiStatusInfo {
+  activeEngine: 'Gemini' | 'LOCAL_FALLBACK' | string;
+  modelUsed: string;
+  errorType?: 'NONE' | 'QUOTA_EXCEEDED' | 'RATE_LIMIT' | 'NETWORK_ERROR' | 'API_ERROR' | string;
+  errorMessage?: string;
+  retryInSeconds?: number;
+}
+

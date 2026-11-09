@@ -1286,16 +1286,23 @@ if (process.env.PORT) {
   if (!isNaN(p) && p > 0) port = p;
 }
 for (let i = 0; i < process.argv.length; i++) {
-  if (process.argv[i] === '--port' && process.argv[i + 1]) {
+  const arg = process.argv[i];
+  if (arg === '--port' && process.argv[i + 1]) {
     const p = Number(process.argv[i + 1]);
+    if (!isNaN(p) && p > 0) port = p;
+  } else if (arg.startsWith('--port=')) {
+    const p = Number(arg.split('=')[1]);
     if (!isNaN(p) && p > 0) port = p;
   }
 }
 
 let host = '0.0.0.0';
 for (let i = 0; i < process.argv.length; i++) {
-  if (process.argv[i] === '--host' && process.argv[i + 1]) {
+  const arg = process.argv[i];
+  if (arg === '--host' && process.argv[i + 1]) {
     host = process.argv[i + 1];
+  } else if (arg.startsWith('--host=')) {
+    host = arg.split('=')[1] || '0.0.0.0';
   }
 }
 
@@ -1308,7 +1315,10 @@ async function startServer() {
   } else {
     const vite = await createViteServer({
       root: __dirname,
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        hmr: false,
+      },
       appType: 'spa',
     });
     app.use(vite.middlewares);
@@ -1320,13 +1330,7 @@ async function startServer() {
 
   server.on('error', (err: any) => {
     if (err.code === 'EADDRINUSE') {
-      console.warn(`Port ${port} is temporarily occupied. Retrying in 1s...`);
-      setTimeout(() => {
-        try {
-          server.close();
-        } catch (_) {}
-        server.listen(port, host);
-      }, 1000);
+      console.warn(`Port ${port} is currently in use. Existing process is serving traffic.`);
     } else {
       console.error('Server error:', err);
     }

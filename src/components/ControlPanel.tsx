@@ -16,7 +16,7 @@ import {
   Settings2,
   RotateCcw,
 } from 'lucide-react';
-import { ChatMessage, GameContext, ObsSettings, ToneStyle } from '../types';
+import { ChatMessage, GameContext, ObsSettings, ToneStyle, MemoryItem, ApiStatusInfo } from '../types';
 import { testAivisSpeechConnection, getAivisBaseUrl } from '../utils/aivisSpeech';
 
 interface ControlPanelProps {
@@ -27,6 +27,7 @@ interface ControlPanelProps {
   isLoading: boolean;
   gameContext: GameContext;
   onUpdateGameContext: (ctx: Partial<GameContext>) => void;
+  onResetGameContext?: () => void;
   obsSettings: ObsSettings;
   onUpdateObsSettings: (settings: Partial<ObsSettings>) => void;
   chatHistory: ChatMessage[];
@@ -41,6 +42,11 @@ interface ControlPanelProps {
   onVoiceNameChange: (v: string) => void;
   isQuotaExceeded?: boolean;
   isUsingBrowserAudio?: boolean;
+  memories?: MemoryItem[];
+  onAddMemory?: (content: string) => void;
+  onEditMemory?: (id: string, newContent: string) => void;
+  onDeleteMemory?: (id: string) => void;
+  apiStatus?: ApiStatusInfo;
 }
 
 const quickReactions = [
@@ -62,6 +68,7 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({
   isLoading,
   gameContext,
   onUpdateGameContext,
+  onResetGameContext,
   obsSettings,
   onUpdateObsSettings,
   chatHistory,
@@ -76,12 +83,18 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({
   onVoiceNameChange,
   isQuotaExceeded = false,
   isUsingBrowserAudio = false,
+  memories = [],
+  onAddMemory,
+  onEditMemory,
+  onDeleteMemory,
+  apiStatus,
 }) => {
   const [inputText, setInputText] = useState('');
   const [activeTab, setActiveTab] = useState<'stream' | 'settings' | 'history'>('stream');
   const [copiedUrl, setCopiedUrl] = useState(false);
   const [aivisTesting, setAivisTesting] = useState(false);
   const [aivisResult, setAivisResult] = useState<string | null>(null);
+  const [newMemoryText, setNewMemoryText] = useState('');
 
   const handleSend = (e?: React.FormEvent) => {
     e?.preventDefault();
@@ -276,9 +289,22 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({
                   <Gamepad2 className="w-4 h-4 text-purple-400" />
                   配信コンテキスト（ゲーム情報）
                 </span>
-                <span className="text-[11px] text-slate-500">
-                  会話の話題やツッコミに反映されます
-                </span>
+                <div className="flex items-center gap-2">
+                  <span className="text-[11px] text-slate-500 hidden sm:inline">
+                    会話の話題やツッコミに反映されます
+                  </span>
+                  {onResetGameContext && (
+                    <button
+                      type="button"
+                      onClick={onResetGameContext}
+                      className="flex items-center gap-1 text-[11px] text-slate-400 hover:text-slate-200 px-2 py-0.5 rounded bg-slate-900 border border-slate-700 hover:border-slate-600 transition-all"
+                      title="おまかせ設定にリセット"
+                    >
+                      <RotateCcw className="w-3 h-3 text-pink-400" />
+                      初期値にリセット
+                    </button>
+                  )}
+                </div>
               </div>
 
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
@@ -460,22 +486,100 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({
 
             {/* Audio Engine & Quota Status Card */}
             <div className="bg-slate-950/60 border border-slate-800 rounded-2xl p-4 space-y-2.5">
-              <div className="flex items-center gap-2 text-xs font-bold text-slate-300">
-                <Sparkles className="w-4 h-4 text-pink-400" />
-                <span>音声＆AIエンジンの稼働状態</span>
-                <span
-                  className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${
-                    isUsingBrowserAudio
-                      ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-400/30'
-                      : 'bg-emerald-500/20 text-emerald-300 border border-emerald-400/30'
-                  }`}
-                >
-                  {isUsingBrowserAudio ? 'ブラウザ高精度音声 (稼働中)' : 'Gemini TTS (稼働中)'}
-                </span>
+              <div className="flex items-center justify-between flex-wrap gap-2">
+                <div className="flex items-center gap-2 text-xs font-bold text-slate-300">
+                  <Sparkles className="w-4 h-4 text-pink-400" />
+                  <span>音声＆AIエンジンの稼働状態</span>
+                </div>
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  <span
+                    className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${
+                      isUsingBrowserAudio
+                        ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-400/30'
+                        : 'bg-emerald-500/20 text-emerald-300 border border-emerald-400/30'
+                    }`}
+                  >
+                    {isUsingBrowserAudio ? 'ブラウザ高精度音声 (稼働中)' : 'Gemini TTS (稼働中)'}
+                  </span>
+                  {apiStatus && (
+                    <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-purple-500/20 text-purple-300 border border-purple-400/30">
+                      {apiStatus.activeEngine}: {apiStatus.modelUsed}
+                    </span>
+                  )}
+                </div>
               </div>
               <p className="text-slate-400 text-xs leading-relaxed">
                 Google Gemini APIの無料利用枠（TTSは1日10回、Flashは1日20回）を超過した場合でも、本アプリは自動的に『ブラウザ音声合成』および『ローカル実況知性エンジン』へシームレスに切り替わります。配信中に返答や音声が途切れることはありません。
               </p>
+            </div>
+
+            {/* Long-term Memories (クマ様 Identity & Settings) Card */}
+            <div className="bg-slate-950/60 border border-slate-800 rounded-2xl p-4 space-y-3">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2 text-xs font-bold text-slate-300">
+                  <Sparkles className="w-4 h-4 text-pink-400" />
+                  <span>相棒の長期記憶（クマ様の設定・思い出）</span>
+                </div>
+                <span className="text-[11px] text-slate-500">
+                  AI相棒が常に記憶する事項
+                </span>
+              </div>
+
+              {memories && memories.length > 0 && (
+                <div className="space-y-2">
+                  {memories.map((m) => (
+                    <div
+                      key={m.id}
+                      className="flex items-center justify-between gap-2 p-2.5 rounded-xl bg-slate-900/80 border border-slate-800 text-xs text-slate-200"
+                    >
+                      <span className="flex-1 leading-relaxed">🐻 {m.content}</span>
+                      {onDeleteMemory && (
+                        <button
+                          type="button"
+                          onClick={() => onDeleteMemory(m.id)}
+                          className="text-slate-500 hover:text-rose-400 p-1 rounded transition-colors"
+                          title="記憶を削除"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {onAddMemory && (
+                <div className="flex items-center gap-2 pt-1">
+                  <input
+                    type="text"
+                    value={newMemoryText}
+                    onChange={(e) => setNewMemoryText(e.target.value)}
+                    placeholder="新しい記憶を追加（例: 愛犬の名前はポチ、好きなゲームはRPG）"
+                    className="flex-1 bg-slate-900 border border-slate-700 rounded-xl px-3 py-1.5 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-pink-500"
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        e.preventDefault();
+                        if (newMemoryText.trim()) {
+                          onAddMemory(newMemoryText.trim());
+                          setNewMemoryText('');
+                        }
+                      }
+                    }}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (newMemoryText.trim()) {
+                        onAddMemory(newMemoryText.trim());
+                        setNewMemoryText('');
+                      }
+                    }}
+                    className="px-3 py-1.5 rounded-xl bg-pink-600 hover:bg-pink-500 text-white font-bold text-xs transition-all shrink-0"
+                  >
+                    追加
+                  </button>
+                </div>
+              )}
             </div>
 
             {/* AivisSpeech Connection Test Card */}
